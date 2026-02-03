@@ -1,0 +1,14 @@
+pip-requirements
+pillow
+imageio
+pyautogui
+numpy
+PyQt5
+mss
+opencv-python
+imageio-ffmpeg
+pyperclip
+pillow
+imageio
+pyautogui
+numpy
