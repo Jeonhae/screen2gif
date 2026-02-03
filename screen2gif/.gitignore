@@ -23,3 +23,18 @@ outputs/
 
 # Editor
 .vscode/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Generated media and logs
+gif/
+video/
+logs/
+*.mp4
+*.gif
+
+# Debug
+debug_runner.py
+

@@ -33,6 +33,11 @@ class OverlayWindow(QtWidgets.QWidget):
     def start_recording(self):
         self.is_recording = True
         self._blink_visible = True
+        # Allow clicks to pass through so the user can interact with apps while recording
+        try:
+            self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        except Exception:
+            pass
         self._blink_timer.start()
         self.update()
 
@@ -40,16 +45,22 @@ class OverlayWindow(QtWidgets.QWidget):
         self.is_recording = False
         self._blink_timer.stop()
         self._blink_visible = True
+        try:
+            self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, False)
+        except Exception:
+            pass
         self.update()
 
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
 
-        # full overlay (60% translucent black)
-        overlay_color = QtGui.QColor(0, 0, 0, int(255 * 0.6))
-        # draw full-screen translucent overlay
-        painter.fillRect(self.rect(), overlay_color)
+        # Dim the screen only during selection; keep it fully transparent while recording
+        if not self.is_recording:
+            overlay_color = QtGui.QColor(0, 0, 0, int(255 * 0.3))
+            painter.fillRect(self.rect(), overlay_color)
+        else:
+            painter.fillRect(self.rect(), QtCore.Qt.transparent)
 
         # clear the selection area from the overlay so underlying content shows through
         if self.selection_rect and not self.selection_rect.isNull():
@@ -200,4 +211,109 @@ class OverlayWindow(QtWidgets.QWidget):
         ny = y + padding
         nw = max(1, w - 2 * padding)
         nh = max(1, h - 2 * padding)
-        return (nx, ny, nw, nh)
+        # Determine which QScreen contains the selection (logical coords)
+        try:
+            screen = QtWidgets.QApplication.screenAt(QtCore.QPoint(int(nx), int(ny)))
+            if screen is None:
+                screen = QtWidgets.QApplication.primaryScreen()
+
+            # devicePixelRatio may be float (1.0, 1.25, 1.5...) depending on Qt build
+            try:
+                # prefer devicePixelRatioF if available
+                dpr = float(screen.devicePixelRatioF()) if hasattr(screen, 'devicePixelRatioF') else float(screen.devicePixelRatio())
+            except Exception:
+                dpr = float(self.devicePixelRatioF() if hasattr(self, 'devicePixelRatioF') else 1.0)
+
+            # Map logical selection relative to screen logical origin, then scale to physical pixels
+            sgeom = screen.geometry()
+            logical_origin_x = sgeom.x()
+            logical_origin_y = sgeom.y()
+
+            # On Windows/Qt the screen origin is often already in physical pixels even when
+            # width/height are logical, so start with the unscaled origin.
+            phys_origin_x = int(round(logical_origin_x))
+            phys_origin_y = int(round(logical_origin_y))
+            scaled_origin_x = int(round(logical_origin_x * dpr))
+            scaled_origin_y = int(round(logical_origin_y * dpr))
+
+            # Try to find matching physical monitor via mss to get accurate physical origin
+            try:
+                import mss as _mss
+                mons = _mss.mss().monitors
+                matched = None
+                for m in mons[1:]:
+                    try:
+                        m_left = int(m.get('left', 0))
+                        m_top = int(m.get('top', 0))
+                    except Exception:
+                        continue
+                    # First try matching against the unscaled origin; fall back to scaled comparison
+                    if abs(m_left - phys_origin_x) < 4 and abs(m_top - phys_origin_y) < 4:
+                        matched = m
+                        break
+                    if abs(m_left - scaled_origin_x) < 4 and abs(m_top - scaled_origin_y) < 4:
+                        matched = m
+                        break
+                if matched:
+                    phys_origin_x = int(matched.get('left', phys_origin_x))
+                    phys_origin_y = int(matched.get('top', phys_origin_y))
+            except Exception:
+                pass
+
+            phys_left = phys_origin_x + int(round((nx - logical_origin_x) * dpr))
+            phys_top = phys_origin_y + int(round((ny - logical_origin_y) * dpr))
+            phys_w = int(round(nw * dpr))
+            phys_h = int(round(nh * dpr))
+        except Exception:
+            # Fallback: scale by widget DPR
+            dpr = float(self.devicePixelRatioF() if hasattr(self, 'devicePixelRatioF') else 1.0)
+            phys_left = int(round(nx * dpr))
+            phys_top = int(round(ny * dpr))
+            phys_w = int(round(nw * dpr))
+            phys_h = int(round(nh * dpr))
+
+        # write overlay->capture mapping debug info
+        try:
+            import os, time
+            dbgdir = os.path.join(os.path.dirname(__file__), 'logs')
+            os.makedirs(dbgdir, exist_ok=True)
+            dbgfile = os.path.join(dbgdir, 'capture_overlay_debug.txt')
+            with open(dbgfile, 'a', encoding='utf-8') as f:
+                f.write(f"time: {time.time()}\n")
+                f.write(f"logical_sel: {(x, y, w, h)}\n")
+                f.write(f"inset_sel: {(nx, ny, nw, nh)}\n")
+                try:
+                    sgeom = screen.geometry()
+                    f.write(f"screen_geom: {sgeom.x()},{sgeom.y()},{sgeom.width()},{sgeom.height()}\n")
+                except Exception:
+                    f.write("screen_geom: <error>\n")
+                f.write(f"dpr: {dpr}\n")
+                try:
+                    f.write(f"phys_origin: {phys_origin_x},{phys_origin_y}\n")
+                    f.write(f"phys_rect: {(phys_left, phys_top, phys_w, phys_h)}\n")
+                except Exception:
+                    f.write("phys: <error>\n")
+                f.write('\n')
+        except Exception:
+            pass
+
+        # Clamp to virtual desktop physical bounds if mss available
+        try:
+            import mss as _mss
+            v = _mss.mss().monitors[0]
+            vleft = int(v.get('left', 0))
+            vtop = int(v.get('top', 0))
+            vright = vleft + int(v.get('width', 0))
+            vbottom = vtop + int(v.get('height', 0))
+            if phys_left < vleft:
+                phys_left = vleft
+            if phys_top < vtop:
+                phys_top = vtop
+            if phys_left + phys_w > vright:
+                phys_left = max(vleft, vright - phys_w)
+            if phys_top + phys_h > vbottom:
+                phys_top = max(vtop, vbottom - phys_h)
+        except Exception:
+            pass
+
+        return (phys_left, phys_top, phys_w, phys_h)

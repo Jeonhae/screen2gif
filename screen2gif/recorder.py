@@ -18,6 +18,24 @@ class ScreenRecorder:
 
     def _capture_loop(self, rect: Tuple[int, int, int, int], fps: int, out_path: str):
         left, top, width, height = rect
+        # write debug info about capture rect and monitors
+        try:
+            import os, time, json
+            dbgdir = os.path.join(os.path.dirname(__file__), 'logs')
+            os.makedirs(dbgdir, exist_ok=True)
+            dbgfile = os.path.join(dbgdir, 'capture_debug.txt')
+            with open(dbgfile, 'a', encoding='utf-8') as f:
+                f.write(f"time: {time.time()}\n")
+                f.write(f"requested_rect: {rect}\n")
+                try:
+                    sct_tmp = mss.mss()
+                    mons = sct_tmp.monitors
+                    f.write(f"mss_monitors: {json.dumps(mons)}\n")
+                except Exception as me:
+                    f.write(f"mss_monitors_error: {me}\n")
+                f.write('\n')
+        except Exception:
+            pass
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         writer = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
         sct = mss.mss()
