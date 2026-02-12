@@ -8,10 +8,7 @@ from datetime import datetime
 from typing import Optional, List, Tuple
 import logging
 
-try:
-    import imageio_ffmpeg
-except Exception:
-    imageio_ffmpeg = None
+# Do not use imageio_ffmpeg fallback - prefer repo/bin/ffmpeg or system ffmpeg.
 
 
 def ensure_dirs(base_dir=None):
@@ -119,30 +116,48 @@ def shrink_gif_to_target(
 
     # Order of preference for ffmpeg executable:
     # 1. Environment variable `SHRINK_FFMPEG_EXE`
-    # 2. System `ffmpeg` on PATH
-    # 3. Repo-local `bin/ffmpeg` (useful for bundled binaries)
-    # 4. imageio_ffmpeg bundled executable
+    # 2. Repo-local `bin/ffmpeg` (preferred)
+    # 3. System `ffmpeg` on PATH
     ffmpeg_exe = os.environ.get("SHRINK_FFMPEG_EXE")
     if ffmpeg_exe and not os.path.exists(ffmpeg_exe):
         ffmpeg_exe = None
+
+    if not ffmpeg_exe:
+        # Check common repo-relative bin locations robustly
+        try:
+            file_path = Path(__file__).resolve()
+            candidates = [
+                file_path.parent / "bin",
+                file_path.parent.parent / "bin",
+                file_path.parent.parent.parent / "bin",
+            ]
+            for c in candidates:
+                candidate = c / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+                if candidate.exists():
+                    ffmpeg_exe = str(candidate)
+                    break
+        except Exception:
+            pass
+
     if not ffmpeg_exe:
         ffmpeg_exe = shutil.which("ffmpeg")
-    if not ffmpeg_exe:
+    # Prefer repo/bin/gifsicle, then env var SHRINK_GIFSICLE_EXE, then system gifsicle
+    gifsicle_exe = os.environ.get("SHRINK_GIFSICLE_EXE")
+    if gifsicle_exe and not os.path.exists(gifsicle_exe):
+        gifsicle_exe = None
+    if not gifsicle_exe:
         try:
-            repo_root = Path(__file__).resolve().parents[1]
-            candidate = repo_root / "bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
-            if candidate.exists():
-                ffmpeg_exe = str(candidate)
+            file_path = Path(__file__).resolve()
+            candidates = [file_path.parent / "bin", file_path.parent.parent / "bin", file_path.parent.parent.parent / "bin"]
+            for c in candidates:
+                candidate = c / ("gifsicle.exe" if os.name == "nt" else "gifsicle")
+                if candidate.exists():
+                    gifsicle_exe = str(candidate)
+                    break
         except Exception:
             pass
-    if not ffmpeg_exe and imageio_ffmpeg is not None:
-        try:
-            exe = imageio_ffmpeg.get_ffmpeg_exe()
-            if exe:
-                ffmpeg_exe = exe
-        except Exception:
-            pass
-    gifsicle_exe = shutil.which("gifsicle")
+    if not gifsicle_exe:
+        gifsicle_exe = shutil.which("gifsicle")
     logging.debug(f"[shrink] ffmpeg_exe={ffmpeg_exe} gifsicle_exe={gifsicle_exe}")
 
     tmpdir = tempfile.mkdtemp(prefix="shrink_gif_")

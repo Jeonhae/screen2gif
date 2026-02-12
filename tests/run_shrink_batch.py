@@ -13,22 +13,38 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 ffmpeg_path = shutil.which("ffmpeg")
 gifsicle_path = shutil.which("gifsicle")
-# If system ffmpeg not present, try to use imageio_ffmpeg's bundled ffmpeg
-# and set `SHRINK_FFMPEG_EXE` so shrink functions use it unambiguously.
+# Prefer repo/bin/ffmpeg over system or imageio; check repo-relative bin first
 if not ffmpeg_path:
     try:
-        import imageio_ffmpeg
-        bundled = imageio_ffmpeg.get_ffmpeg_exe()
-        if bundled and Path(bundled).exists():
-            os.environ["SHRINK_FFMPEG_EXE"] = str(bundled)
-            print(f"Set SHRINK_FFMPEG_EXE to imageio_ffmpeg binary: {bundled}")
-            ffmpeg_path = bundled
+        file_path = Path(__file__).resolve()
+        candidates = [file_path.parent.parent / "bin", file_path.parent / "bin"]
+        for c in candidates:
+            candidate = c / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+            if candidate.exists():
+                os.environ["SHRINK_FFMPEG_EXE"] = str(candidate)
+                ffmpeg_path = str(candidate)
+                print(f"Set SHRINK_FFMPEG_EXE to repo bin: {candidate}")
+                break
     except Exception:
         pass
+
 if not ffmpeg_path:
     print("Warning: ffmpeg not found; shrink will skip ffmpeg steps.")
 if not gifsicle_path:
-    print("Warning: gifsicle not found; gifsicle steps will be skipped.")
+    # Try repo/bin gifsicle
+    try:
+        file_path = Path(__file__).resolve()
+        for c in (file_path.parent.parent / "bin", file_path.parent / "bin"):
+            candidate = c / ("gifsicle.exe" if os.name == "nt" else "gifsicle")
+            if candidate.exists():
+                os.environ["SHRINK_GIFSICLE_EXE"] = str(candidate)
+                gifsicle_path = str(candidate)
+                print(f"Set SHRINK_GIFSICLE_EXE to repo bin: {candidate}")
+                break
+    except Exception:
+        pass
+    if not gifsicle_path:
+        print("Warning: gifsicle not found; gifsicle steps will be skipped.")
 
 from utils import shrink_gif_to_target
 

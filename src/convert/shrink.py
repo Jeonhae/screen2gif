@@ -6,10 +6,7 @@ import tempfile
 import logging
 from typing import Optional
 
-try:
-    import imageio_ffmpeg
-except Exception:
-    imageio_ffmpeg = None
+# Do not use imageio_ffmpeg fallback - prefer repo/bin/ffmpeg or system ffmpeg.
 
 from src.utils.logging_config import append_diagnostic
 try:
@@ -47,26 +44,41 @@ def shrink_gif_to_target(gif_path: str, target_bytes: int, out_dir: str) -> Opti
     ffmpeg_exe = os.environ.get("SHRINK_FFMPEG_EXE")
     if ffmpeg_exe and not os.path.exists(ffmpeg_exe):
         ffmpeg_exe = None
+
+    if not ffmpeg_exe:
+        try:
+            file_path = Path(__file__).resolve()
+            candidates = [
+                file_path.parent.parent / "bin",
+                file_path.parent.parent.parent / "bin",
+                file_path.parent / "bin",
+            ]
+            for c in candidates:
+                candidate = c / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+                if candidate.exists():
+                    ffmpeg_exe = str(candidate)
+                    break
+        except Exception:
+            pass
+
     if not ffmpeg_exe:
         ffmpeg_exe = shutil.which("ffmpeg")
-    if not ffmpeg_exe:
+    gifsicle_exe = os.environ.get("SHRINK_GIFSICLE_EXE")
+    if gifsicle_exe and not os.path.exists(gifsicle_exe):
+        gifsicle_exe = None
+    if not gifsicle_exe:
         try:
-            from pathlib import Path
-
-            repo_root = Path(__file__).resolve().parents[2]
-            candidate = repo_root / "bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
-            if candidate.exists():
-                ffmpeg_exe = str(candidate)
+            file_path = Path(__file__).resolve()
+            candidates = [file_path.parent.parent / "bin", file_path.parent / "bin"]
+            for c in candidates:
+                candidate = c / ("gifsicle.exe" if os.name == "nt" else "gifsicle")
+                if candidate.exists():
+                    gifsicle_exe = str(candidate)
+                    break
         except Exception:
             pass
-    if not ffmpeg_exe and imageio_ffmpeg is not None:
-        try:
-            exe = imageio_ffmpeg.get_ffmpeg_exe()
-            if exe:
-                ffmpeg_exe = exe
-        except Exception:
-            pass
-    gifsicle_exe = shutil.which("gifsicle")
+    if not gifsicle_exe:
+        gifsicle_exe = shutil.which("gifsicle")
     logging.debug(f"[shrink] ffmpeg_exe={ffmpeg_exe} gifsicle_exe={gifsicle_exe}")
 
     tmpdir = tempfile.mkdtemp(prefix="shrink_gif_")
