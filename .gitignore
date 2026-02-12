@@ -1,0 +1,40 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Output files
+out.gif
+outputs/
+
+# Editor
+.vscode/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Generated media and logs
+gif/
+video/
+logs/
+*.mp4
+*.gif
+
+# Debug
+debug_runner.py
+

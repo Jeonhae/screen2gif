@@ -1,0 +1,9 @@
+Pillow
+imageio
+imageio-ffmpeg
+pyautogui
+numpy
+PyQt5
+mss
+opencv-python
+pyperclip
