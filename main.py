@@ -340,6 +340,12 @@ def start_recording_flow(ctx, rect):
     x, y, w, h = rect
     output_mp4 = timestamped_filename("video", "mp4")
 
+    # Ensure video output folder is clean before writing a new recording.
+    try:
+        clear_video_folder()
+    except Exception:
+        logging.exception("clear_video_folder failed in start_recording_flow")
+
     # Try to exclude overlay and toolbar windows from being captured
     try:
         if sys.platform == "win32":
@@ -413,10 +419,6 @@ def stop_recording_flow(ctx):
     recorder = ctx.recorder
     visibility_monitor = ctx.visibility_monitor
 
-    try:
-        clear_video_folder()
-    except Exception:
-        logging.exception("clear_video_folder failed in stop_recording_flow")
     mp4_path = recorder.stop()
     try:
         visibility_monitor.stop()
@@ -500,14 +502,26 @@ def stop_recording_flow(ctx):
                     logging.exception("GIF shrinking failed in stop_recording_flow")
         except Exception:
             logging.exception("GIF shrinking failed in stop_recording_flow")
-        copy_path_to_clipboard(gif_path)
+        copied_ok = False
         try:
-            show_topmost_message(
-                None,
-                "完成",
-                f"GIF已生成并复制至剪切板。\n路径:{gif_path}\n按Ctrl+V粘贴至目标位置。",
-                icon=QtWidgets.QMessageBox.Information,
-            )
+            copied_ok = bool(copy_path_to_clipboard(gif_path))
+        except Exception:
+            logging.exception("copy_path_to_clipboard failed in stop_recording_flow")
+        try:
+            if copied_ok:
+                show_topmost_message(
+                    None,
+                    "Success",
+                    f"GIF generated and copied to clipboard.\nPath: {gif_path}\nPress Ctrl+V to paste.",
+                    icon=QtWidgets.QMessageBox.Information,
+                )
+            else:
+                show_topmost_message(
+                    None,
+                    "GIF generated",
+                    f"GIF generated, but failed to copy to clipboard.\nPath: {gif_path}",
+                    icon=QtWidgets.QMessageBox.Warning,
+                )
         except Exception:
             logging.exception("show_topmost_message failed after convert")
     else:

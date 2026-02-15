@@ -34,6 +34,7 @@ def convert_mp4_to_gif(mp4_path: str, gif_path: str, fps: int = 10) -> bool:
             return False
 
     # Fallback: use imageio to read video and write GIF
+    reader = None
     try:
         reader = imageio.get_reader(mp4_path)
         frames = [frame for frame in reader]
@@ -43,3 +44,9 @@ def convert_mp4_to_gif(mp4_path: str, gif_path: str, fps: int = 10) -> bool:
         return True
     except Exception:
         return False
+    finally:
+        try:
+            if reader is not None:
+                reader.close()
+        except Exception:
+            pass

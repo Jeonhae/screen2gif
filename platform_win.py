@@ -1,7 +1,8 @@
 import logging
+from typing import Optional
 
 
-def get_hwnd(widget) -> int | None:
+def get_hwnd(widget) -> Optional[int]:
     """Return native window handle (HWND) for a Qt widget, or None."""
     try:
         if widget is None:

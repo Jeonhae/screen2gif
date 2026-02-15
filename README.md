@@ -19,7 +19,7 @@ python -m pip install -r requirements.txt
 2. Run the example capture:
 
 ```bash
-python screenshot2gif.py --duration 5 --fps 2 --output out.gif
+python screen2gif.py --duration 5 --fps 2 --output out.gif
 ```
 
 Notes
