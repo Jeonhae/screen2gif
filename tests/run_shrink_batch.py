@@ -2,8 +2,10 @@
 import os
 import time
 import csv
+import json
 import glob
 import sys
+import uuid
 from pathlib import Path
 import shutil
 
@@ -53,8 +55,13 @@ OUT_DIR.mkdir(exist_ok=True)
 LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(exist_ok=True)
 REPORT = LOGS_DIR / "shrink_batch_report.csv"
+METRICS_REPORT = LOGS_DIR / "shrink_batch_metrics_report.csv"
+METRICS_LOG = LOGS_DIR / "shrink_metrics.jsonl"
 
 TARGET_BYTES = int(os.environ.get("SHRINK_BATCH_TARGET_BYTES", str(2_000_000)))
+RUN_ID = os.environ.get("SHRINK_METRICS_RUN_ID") or f"batch_{uuid.uuid4().hex[:10]}"
+os.environ["SHRINK_METRICS_RUN_ID"] = RUN_ID
+print(f"RUN_ID={RUN_ID}")
 
 # find gif files
 candidates = sorted(glob.glob("gif/*.gif") + glob.glob("pkg/minimal/gif/*.gif") + glob.glob("screen2gif/gif/*.gif"))
@@ -106,3 +113,67 @@ sorted_rows = sorted(rows, key=lambda r: float(r["duration_s"]) if r["duration_s
 print("Top 5 slowest:")
 for r in sorted_rows[:5]:
     print(f"{r['input']} {r['duration_s']}s {r['success']} {r['out_size']}")
+
+# parse metrics log for this run
+metric_rows = []
+if METRICS_LOG.exists():
+    with open(METRICS_LOG, "r", encoding="utf-8") as mf:
+        for line in mf:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if obj.get("run_id") == RUN_ID:
+                metric_rows.append(obj)
+
+if metric_rows:
+    with open(METRICS_REPORT, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "run_id",
+                "input_gif",
+                "target_bytes",
+                "orig_size",
+                "source_type",
+                "cache_hit",
+                "ffmpeg_variants",
+                "ffmpeg_blacklist_skips",
+                "ffmpeg_early_stop",
+                "gifsicle_variants",
+                "gifsicle_early_stop",
+                "status",
+                "result_path",
+                "result_size",
+                "duration_ms",
+            ],
+        )
+        writer.writeheader()
+        for r in metric_rows:
+            writer.writerow({k: r.get(k, "") for k in writer.fieldnames})
+    print(f"Metrics report written: {METRICS_REPORT}")
+
+    def _avg(vals):
+        vals = [float(v) for v in vals if v not in (None, "")]
+        return (sum(vals) / len(vals)) if vals else 0.0
+
+    avg_ms = _avg([r.get("duration_ms") for r in metric_rows])
+    avg_ff = _avg([r.get("ffmpeg_variants") for r in metric_rows])
+    avg_gs = _avg([r.get("gifsicle_variants") for r in metric_rows])
+    cache_hits = {}
+    for r in metric_rows:
+        k = r.get("cache_hit") or "none"
+        cache_hits[k] = cache_hits.get(k, 0) + 1
+    print(
+        "Metrics summary: "
+        f"runs={len(metric_rows)} "
+        f"avg_duration_ms={avg_ms:.1f} "
+        f"avg_ffmpeg_variants={avg_ff:.2f} "
+        f"avg_gifsicle_variants={avg_gs:.2f} "
+        f"cache_hits={cache_hits}"
+    )
+else:
+    print("No per-run metrics rows found in shrink_metrics.jsonl for this run_id.")
