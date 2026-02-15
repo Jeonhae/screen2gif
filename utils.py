@@ -91,7 +91,10 @@ def clear_gif_folder(base_dir: Optional[str] = None) -> Tuple[List[str], List[Tu
 
 
 def shrink_gif_to_target(
-    gif_path: str, target_bytes: int, out_dir: str
+    gif_path: str,
+    target_bytes: int,
+    out_dir: str,
+    source_mp4_path: Optional[str] = None,
 ) -> Optional[str]:
     """Reduce `gif_path` to be <= `target_bytes` and place result in `out_dir`.
 
@@ -114,6 +117,11 @@ def shrink_gif_to_target(
 
     # debug info
     logging.debug(f"[shrink] orig_size={orig_size} target_bytes={target_bytes}")
+    ffmpeg_input = (
+        source_mp4_path
+        if source_mp4_path and os.path.exists(source_mp4_path)
+        else gif_path
+    )
 
     # Order of preference for ffmpeg executable:
     # 1. Environment variable `SHRINK_FFMPEG_EXE`
@@ -277,7 +285,7 @@ def shrink_gif_to_target(
                             ffmpeg_exe,
                             "-y",
                             "-i",
-                            gif_path,
+                            ffmpeg_input,
                             "-vf",
                             ("fps=" + str(fps) + "," + scale_expr + ",palettegen"),
                             palette,
@@ -293,7 +301,7 @@ def shrink_gif_to_target(
                         ffmpeg_exe,
                         "-y",
                         "-i",
-                        gif_path,
+                        ffmpeg_input,
                         "-i",
                         palette,
                         "-lavfi",
@@ -422,8 +430,9 @@ def shrink_gif_to_target(
             src_width = _probe_gif_width(gif_path)
             hi_width = int(src_width) if src_width else 800
             min_width_effective = min_width if hi_width >= min_width else hi_width
+            source_tag = "mp4" if ffmpeg_input != gif_path else "gif"
             cache_key = (
-                f"w{hi_width}_t{int(target_bytes)}_b{int(orig_size // (256 * 1024))}"
+                f"{source_tag}_w{hi_width}_t{int(target_bytes)}_b{int(orig_size // (256 * 1024))}"
             )
 
             cached_entry = cache_data.get(cache_key)

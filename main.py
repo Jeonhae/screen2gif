@@ -494,7 +494,10 @@ def stop_recording_flow(ctx):
             else:
                 try:
                     shr = shrink_gif_to_target(
-                        gif_path, DEFAULT_GIF_TARGET_BYTES, small_dir
+                        gif_path,
+                        DEFAULT_GIF_TARGET_BYTES,
+                        small_dir,
+                        source_mp4_path=mp4_path,
                     )
                     if shr:
                         gif_path = shr
