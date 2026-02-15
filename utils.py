@@ -376,6 +376,70 @@ def shrink_gif_to_target(
                 except Exception:
                     pass
 
+            def _normalize_cached_width(v):
+                if v == "orig":
+                    return None
+                return int(v)
+
+            def _try_cached_entry(cache_entry, cache_key_for_write: str):
+                if not isinstance(cache_entry, dict):
+                    return None
+                try:
+                    c_width = _normalize_cached_width(cache_entry.get("width"))
+                    c_fps = int(cache_entry.get("fps"))
+                    cached_path = _produce(c_width, c_fps)
+                    if cached_path and _fits_target(cached_path):
+                        _cache_set(cache_key_for_write, c_width, c_fps)
+                        return cached_path
+                except Exception:
+                    return None
+                return None
+
+            def _parse_cache_key_meta(k: str):
+                # Format: "{source}_w{width}_t{target}_b{bucket}"
+                try:
+                    p = str(k).split("_")
+                    if len(p) != 4:
+                        return None
+                    src = p[0]
+                    w = int(p[1][1:])
+                    t = int(p[2][1:])
+                    b = int(p[3][1:])
+                    return src, w, t, b
+                except Exception:
+                    return None
+
+            def _find_neighbor_cache_entry(
+                src_tag: str, width_now: int, target_now: int, bucket_now: int
+            ):
+                best_key = None
+                best_entry = None
+                best_score = None
+                denom_w = max(1.0, float(width_now))
+                denom_t = max(1.0, float(target_now))
+                denom_b = max(1.0, float(bucket_now if bucket_now > 0 else 1))
+                for k, entry in cache_data.items():
+                    meta = _parse_cache_key_meta(k)
+                    if not meta:
+                        continue
+                    src, w, t, b = meta
+                    if src != src_tag:
+                        continue
+                    dw = abs(float(w - width_now)) / denom_w
+                    dt = abs(float(t - target_now)) / denom_t
+                    db = abs(float(b - bucket_now)) / denom_b
+                    score = (0.65 * dw) + (0.25 * dt) + (0.10 * db)
+                    if best_score is None or score < best_score:
+                        best_score = score
+                        best_key = k
+                        best_entry = entry
+                if best_entry is None:
+                    return None, None
+                # Keep neighbor match reasonably close.
+                if best_score is not None and best_score <= 0.40:
+                    return best_key, best_entry
+                return None, None
+
             def _produce(width, fps):
                 key = (width, fps)
                 while True:
@@ -457,12 +521,23 @@ def shrink_gif_to_target(
             def _best_fps_path_for_width(width):
                 high_fps = 15
                 low_fps = 5
-                first_batch = _eval_fps_candidates(width, [high_fps, low_fps])
-                high_path = first_batch.get(high_fps)
-                if high_path and _fits_target(high_path):
-                    return high_path, high_fps
+                coarse_fps = [high_fps, 10, low_fps]
+                coarse_batch = _eval_fps_candidates(width, coarse_fps)
+                coarse_fit = []
+                coarse_nonfit = []
+                for fps in sorted(set(coarse_fps), reverse=True):
+                    p = coarse_batch.get(fps)
+                    if not p:
+                        continue
+                    if _fits_target(p):
+                        coarse_fit.append((fps, p))
+                    else:
+                        coarse_nonfit.append((fps, p))
 
-                low_path = first_batch.get(low_fps)
+                if coarse_fit and coarse_fit[0][0] >= high_fps:
+                    return coarse_fit[0][1], coarse_fit[0][0]
+
+                low_path = coarse_batch.get(low_fps)
                 if not (low_path and _fits_target(low_path)):
                     return None
                 low_size = _path_size(low_path)
@@ -475,10 +550,17 @@ def shrink_gif_to_target(
                     )
                     return None
 
-                best_fit_path = low_path
-                best_fit_fps = low_fps
-                lo = low_fps + 1
-                hi = high_fps - 1
+                if coarse_fit:
+                    best_fit_fps, best_fit_path = max(coarse_fit, key=lambda x: x[0])
+                else:
+                    best_fit_fps, best_fit_path = low_fps, low_path
+
+                nonfit_above = [fps for fps, _ in coarse_nonfit if fps > best_fit_fps]
+                if nonfit_above:
+                    hi = min(nonfit_above) - 1
+                else:
+                    hi = high_fps - 1
+                lo = best_fit_fps + 1
                 while lo <= hi:
                     mid = (lo + hi) // 2
                     mid_path = _produce(width, mid)
@@ -519,25 +601,25 @@ def shrink_gif_to_target(
             cache_key = (
                 f"{source_tag}_w{hi_width}_t{int(target_bytes)}_b{int(orig_size // (256 * 1024))}"
             )
+            size_bucket_now = int(orig_size // (256 * 1024))
 
             cached_entry = cache_data.get(cache_key)
-            if isinstance(cached_entry, dict):
-                try:
-                    c_width = cached_entry.get("width")
-                    c_fps = int(cached_entry.get("fps"))
-                    if c_width == "orig":
-                        c_width = None
-                    else:
-                        c_width = int(c_width)
-                    cached_path = _produce(c_width, c_fps)
-                    if cached_path and _fits_target(cached_path):
-                        name = os.path.splitext(os.path.basename(gif_path))[0]
-                        dst = os.path.join(out_dir, f"{name}_small.gif")
-                        shutil.move(cached_path, dst)
-                        _cache_set(cache_key, c_width, c_fps)
-                        return dst
-                except Exception:
-                    pass
+            cached_path = _try_cached_entry(cached_entry, cache_key)
+            if not cached_path:
+                near_key, near_entry = _find_neighbor_cache_entry(
+                    source_tag, hi_width, int(target_bytes), size_bucket_now
+                )
+                if near_entry is not None:
+                    cached_path = _try_cached_entry(near_entry, cache_key)
+                    if cached_path:
+                        logging.debug(
+                            "[shrink] cache near-hit: key=%s from=%s", cache_key, near_key
+                        )
+            if cached_path:
+                name = os.path.splitext(os.path.basename(gif_path))[0]
+                dst = os.path.join(out_dir, f"{name}_small.gif")
+                shutil.move(cached_path, dst)
+                return dst
 
             # First try original width (highest quality) with FPS binary search.
             best_orig = _best_fps_path_for_width(None)
