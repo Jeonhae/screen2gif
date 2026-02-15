@@ -11,6 +11,7 @@ class ToolBar(QtWidgets.QWidget):
 
     def __init__(self):
         super().__init__()
+        self.setObjectName("Screen2GIFToolbar")
         self.setWindowFlags(
             QtCore.Qt.Tool
             | QtCore.Qt.WindowStaysOnTopHint

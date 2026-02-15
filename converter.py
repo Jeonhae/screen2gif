@@ -1,12 +1,11 @@
 import os
-import shutil
 import subprocess
-import tempfile
+import logging
+import time
+import uuid
 import imageio
 
-
-def has_ffmpeg() -> bool:
-    return shutil.which("ffmpeg") is not None
+from utils import resolve_ffmpeg_exe
 
 
 def convert_mp4_to_gif(mp4_path: str, gif_path: str, fps: int = 10) -> bool:
@@ -15,11 +14,17 @@ def convert_mp4_to_gif(mp4_path: str, gif_path: str, fps: int = 10) -> bool:
     Returns True on success, False on failure.
     """
     # Use ffmpeg when available for quality
-    if has_ffmpeg():
-        tmpdir = tempfile.mkdtemp(prefix="mp4_to_gif_")
-        palette_path = os.path.join(tmpdir, "palette.png")
+    ffmpeg_exe = resolve_ffmpeg_exe()
+    if ffmpeg_exe:
+        ffmpeg_cmd = ffmpeg_exe
+        tmp_root = os.path.join(os.path.dirname(__file__), "tmp_ffmpeg")
+        os.makedirs(tmp_root, exist_ok=True)
+        palette_path = os.path.join(
+            tmp_root,
+            f"palette_{uuid.uuid4().hex}.png",
+        )
         gen_palette_cmd = [
-            "ffmpeg",
+            ffmpeg_cmd,
             "-y",
             "-i",
             mp4_path,
@@ -28,7 +33,7 @@ def convert_mp4_to_gif(mp4_path: str, gif_path: str, fps: int = 10) -> bool:
             palette_path,
         ]
         gif_cmd = [
-            "ffmpeg",
+            ffmpeg_cmd,
             "-y",
             "-i",
             mp4_path,
@@ -44,31 +49,50 @@ def convert_mp4_to_gif(mp4_path: str, gif_path: str, fps: int = 10) -> bool:
             gif_path,
         ]
         try:
-            subprocess.run(
+            gen_res = subprocess.run(
                 gen_palette_cmd,
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
             )
-            subprocess.run(
+            if gen_res.returncode != 0:
+                logging.error(
+                    "ffmpeg palette generation failed (code=%s): %s",
+                    gen_res.returncode,
+                    (gen_res.stderr or "").strip()[-1000:],
+                )
+                return False
+
+            gif_res = subprocess.run(
                 gif_cmd,
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
             )
+            if gif_res.returncode != 0:
+                logging.error(
+                    "ffmpeg gif conversion failed (code=%s): %s",
+                    gif_res.returncode,
+                    (gif_res.stderr or "").strip()[-1000:],
+                )
+                return False
             return True
-        except subprocess.CalledProcessError:
+        except OSError:
+            logging.exception("Failed to execute ffmpeg")
+            return False
+        except Exception:
+            logging.exception("Unexpected ffmpeg conversion error")
             return False
         finally:
-            try:
-                if os.path.exists(palette_path):
-                    os.remove(palette_path)
-            except Exception:
-                pass
-            try:
-                os.rmdir(tmpdir)
-            except Exception:
-                pass
+            for _ in range(3):
+                try:
+                    if os.path.exists(palette_path):
+                        os.remove(palette_path)
+                    break
+                except PermissionError:
+                    # ffmpeg can keep the handle briefly on Windows.
+                    time.sleep(0.05)
+                except Exception:
+                    logging.exception("Failed to remove temporary ffmpeg palette file")
+                    break
 
     # Fallback: use imageio to read video and write GIF
     reader = None
@@ -82,15 +106,16 @@ def convert_mp4_to_gif(mp4_path: str, gif_path: str, fps: int = 10) -> bool:
             frame_count += 1
         return frame_count > 0
     except Exception:
+        logging.exception("imageio fallback conversion failed")
         return False
     finally:
         try:
             if writer is not None:
                 writer.close()
         except Exception:
-            pass
+            logging.exception("Failed to close imageio writer")
         try:
             if reader is not None:
                 reader.close()
         except Exception:
-            pass
+            logging.exception("Failed to close imageio reader")

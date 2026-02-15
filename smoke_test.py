@@ -20,9 +20,9 @@ def run_smoke():
     rec.start(rect, fps=10, out_path=mp4)
     time.sleep(2.2)
     print("SMOKE: stopping recording")
-    mp4_path = rec.stop()
-    print("SMOKE: mp4_path=", mp4_path)
-    if not mp4_path:
+    mp4_path, stopped_ok = rec.stop()
+    print("SMOKE: mp4_path=", mp4_path, "stopped_ok=", stopped_ok)
+    if not stopped_ok or not mp4_path:
         print("SMOKE: recording failed")
         return 1
     print("SMOKE: converting to gif ->", gif)

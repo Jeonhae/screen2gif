@@ -340,7 +340,13 @@ class GifConversionWorker(QtCore.QObject):
     def run(self):
         result = {"ok": False, "gif_path": None, "error": "Unknown conversion error"}
         try:
-            clear_gif_folder()
+            _removed, clear_errors = clear_gif_folder()
+            if clear_errors:
+                logging.warning(
+                    "clear_gif_folder had %d error(s): %s",
+                    len(clear_errors),
+                    clear_errors[:3],
+                )
             gif_path = timestamped_filename("gif", "gif")
             ok = convert_mp4_to_gif(self._mp4_path, gif_path, fps=10)
             if not ok:
@@ -457,7 +463,13 @@ def start_recording_flow(ctx, rect):
 
     # Ensure video output folder is clean before writing a new recording.
     try:
-        clear_video_folder()
+        _removed, clear_errors = clear_video_folder()
+        if clear_errors:
+            logging.warning(
+                "clear_video_folder had %d error(s): %s",
+                len(clear_errors),
+                clear_errors[:3],
+            )
     except Exception:
         logging.exception("clear_video_folder failed in start_recording_flow")
 
@@ -478,7 +490,7 @@ def start_recording_flow(ctx, rect):
             try:
                 _process_ui_events_wait(120)
             except Exception:
-                pass
+                logging.exception("_process_ui_events_wait failed in start_flow")
     except Exception:
         logging.exception("Unexpected error in start_recording_flow platform logic")
 
@@ -488,7 +500,17 @@ def start_recording_flow(ctx, rect):
         logging.exception("overlay.start_recording failed in start_recording_flow")
 
     try:
-        started = recorder.start((x, y, w, h), fps=10, out_path=output_mp4)
+        started = recorder.start(
+            (x, y, w, h),
+            fps=10,
+            out_path=output_mp4,
+            startup_timeout=3.0,
+        )
+        if (not started) and recorder.is_recording():
+            logging.warning(
+                "Recorder startup returned False but thread is recording; continuing"
+            )
+            started = True
         _process_ui_events_wait(120)
         if (not started) or (not recorder.is_recording()):
             try:
@@ -689,6 +711,7 @@ def main():
 
         def __init__(self):
             super().__init__()
+            self.setObjectName("Screen2GIFInitialWindow")
             self.setWindowTitle("Screen2GIF")
             # Use a normal window so it reliably appears (not a tool window)
             self.setWindowFlags(QtCore.Qt.Window | QtCore.Qt.WindowStaysOnTopHint)
@@ -756,14 +779,6 @@ def main():
         initial.showNormal()
         initial.raise_()
         initial.activateWindow()
-
-    # Shared timer for countdown
-    _countdown_timer = QtCore.QTimer()
-
-    # Monitor toolbar visibility during recording. If toolbar disappears unexpectedly
-    # while recorder thread is alive, quit the application so the terminal shows exit.
-    _visibility_monitor = QtCore.QTimer()
-    _visibility_monitor.setInterval(300)
 
     # Prepare a small context object for monitor callbacks
     class _Ctx:
@@ -1259,7 +1274,7 @@ def main():
         try:
             toolbar.moved.connect(_bring_toolbar_top)
         except Exception:
-            pass
+            logging.exception("Failed to connect toolbar.moved handler")
         # Also ensure toolbar does not overlap selection when entering record mode
         try:
 
@@ -1273,34 +1288,34 @@ def main():
             # call once now to enforce position when entering record mode
             _ensure_no_overlap_on_enter()
         except Exception:
-            pass
+            logging.exception("Failed to run initial no-overlap placement")
     except Exception:
-        pass
-        # On Windows, explicitly adjust Z-order using SetWindowPos.
-        # This ensures the toolbar is placed above the overlay.
-        try:
-            if sys.platform == "win32":
-                try:
-                    from platform_win import (
-                        get_hwnd,
-                        set_window_topmost,
-                        set_exclude_from_capture,
-                        try_set_display_affinity,
-                    )
+        logging.exception("Failed to wire toolbar/overlay interaction handlers")
+    # On Windows, explicitly adjust Z-order using SetWindowPos.
+    # This ensures the toolbar is placed above the overlay.
+    try:
+        if sys.platform == "win32":
+            try:
+                from platform_win import (
+                    get_hwnd,
+                    set_window_topmost,
+                    set_exclude_from_capture,
+                    try_set_display_affinity,
+                )
 
-                    ov_hwnd = get_hwnd(overlay)
-                    tb_hwnd = get_hwnd(toolbar)
-                    if ov_hwnd:
-                        set_window_topmost(ov_hwnd)
-                    if tb_hwnd:
-                        set_window_topmost(tb_hwnd)
-                        # Best-effort: exclude toolbar from capture and set affinity
-                        set_exclude_from_capture(tb_hwnd, True)
-                        try_set_display_affinity(tb_hwnd)
-                except Exception:
-                    logging.exception("Windows Z-order/DWM setup failed during startup")
-        except Exception:
-            logging.exception("Unexpected error in startup platform logic")
+                ov_hwnd = get_hwnd(overlay)
+                tb_hwnd = get_hwnd(toolbar)
+                if ov_hwnd:
+                    set_window_topmost(ov_hwnd)
+                if tb_hwnd:
+                    set_window_topmost(tb_hwnd)
+                    # Best-effort: exclude toolbar from capture and set affinity
+                    set_exclude_from_capture(tb_hwnd, True)
+                    try_set_display_affinity(tb_hwnd)
+            except Exception:
+                logging.exception("Windows Z-order/DWM setup failed during startup")
+    except Exception:
+        logging.exception("Unexpected error in startup platform logic")
     # Show the initial launcher window (do not enter recording until user requests)
     try:
         # center and show the initial window as a normal window

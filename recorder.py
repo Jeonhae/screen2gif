@@ -15,6 +15,8 @@ class ScreenRecorder:
         self._out_path: Optional[str] = None
         self._rect: Optional[Tuple[int, int, int, int]] = None
         self._fps = 10
+        self._start_event = threading.Event()
+        self._start_ok = False
 
     def _capture_loop(
         self, rect: Tuple[int, int, int, int], fps: int, out_path: str
@@ -39,16 +41,26 @@ class ScreenRecorder:
                     f.write(f"mss_monitors_error: {me}\n")
                 f.write("\n")
         except Exception:
-            pass
+            logging.exception("Failed to write capture debug header")
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = None
-        sct = mss.mss()
+        sct = None
         interval = 1.0 / float(max(1, fps))
         try:
             if width <= 0 or height <= 0:
                 logging.error("Invalid capture dimensions: %s", rect)
+                self._start_ok = False
+                self._start_event.set()
                 return
+            sct = mss.mss()
             writer = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
+            if not writer.isOpened():
+                logging.error("Failed to open VideoWriter for: %s", out_path)
+                self._start_ok = False
+                self._start_event.set()
+                return
+            self._start_ok = True
+            self._start_event.set()
 
             # performance diagnostics
             dbgdir = os.path.join(os.path.dirname(__file__), "logs")
@@ -109,7 +121,10 @@ class ScreenRecorder:
                                 f"avg_enc_ms={avg_enc:.2f}\n"
                             )
                     except Exception:
-                        pass
+                        logging.debug(
+                            "Failed to write capture performance report",
+                            exc_info=True,
+                        )
                     grab_times = []
                     encode_times = []
                     frame_count = 0
@@ -125,6 +140,9 @@ class ScreenRecorder:
                     time.sleep(0)
         except Exception:
             logging.exception("Unexpected exception in capture loop")
+            if not self._start_event.is_set():
+                self._start_ok = False
+                self._start_event.set()
         finally:
             try:
                 if writer is not None:
@@ -136,7 +154,11 @@ class ScreenRecorder:
                 self._thread = None
 
     def start(
-        self, rect: Tuple[int, int, int, int], fps: int = 10, out_path: str = None
+        self,
+        rect: Tuple[int, int, int, int],
+        fps: int = 10,
+        out_path: str = None,
+        startup_timeout: float = 3.0,
     ):
         if self.is_recording():
             return False
@@ -144,11 +166,32 @@ class ScreenRecorder:
         self._rect = rect
         self._fps = fps
         self._out_path = out_path or "video/out.mp4"
+        self._start_ok = False
+        self._start_event.clear()
         self._thread = threading.Thread(
             target=self._capture_loop, args=(rect, fps, self._out_path), daemon=True
         )
         self._thread.start()
-        return True
+        timeout = max(0.0, float(startup_timeout))
+        deadline = time.perf_counter() + timeout
+        while True:
+            now = time.perf_counter()
+            remaining = max(0.0, deadline - now)
+            if self._start_event.wait(timeout=min(0.2, remaining)):
+                return self._start_ok
+
+            # If the thread exited before signaling startup, treat as failure.
+            if not (self._thread and self._thread.is_alive()):
+                logging.error("Recorder thread exited before initialization finished")
+                return False
+
+            if remaining <= 0.0:
+                logging.error(
+                    "Recorder start timed out before capture loop initialized "
+                    "(timeout=%.2fs)",
+                    timeout,
+                )
+                return False
 
     def is_recording(self) -> bool:
         return bool(self._thread and self._thread.is_alive())

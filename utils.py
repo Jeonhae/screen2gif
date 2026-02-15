@@ -21,6 +21,40 @@ def ensure_dirs(base_dir=None):
         os.makedirs(p, exist_ok=True)
 
 
+def resolve_ffmpeg_exe() -> Optional[str]:
+    """Resolve ffmpeg executable path using repo/local preferences.
+
+    Order of preference:
+    1. Environment variable `SHRINK_FFMPEG_EXE`
+    2. Repo-local `bin/ffmpeg` (preferred)
+    3. System `ffmpeg` on PATH
+    """
+    ffmpeg_exe = os.environ.get("SHRINK_FFMPEG_EXE")
+    if ffmpeg_exe and not os.path.exists(ffmpeg_exe):
+        ffmpeg_exe = None
+
+    if not ffmpeg_exe:
+        try:
+            file_path = Path(__file__).resolve()
+            candidates = [
+                file_path.parent / "bin",
+                file_path.parent.parent / "bin",
+                file_path.parent.parent.parent / "bin",
+            ]
+            for c in candidates:
+                candidate = c / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+                if candidate.exists():
+                    ffmpeg_exe = str(candidate)
+                    break
+        except Exception:
+            pass
+
+    if not ffmpeg_exe:
+        ffmpeg_exe = shutil.which("ffmpeg")
+
+    return ffmpeg_exe
+
+
 def timestamped_filename(folder: str, ext: str) -> str:
     base = os.path.dirname(__file__)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -171,33 +205,7 @@ def shrink_gif_to_target(
     )
     metrics["source_type"] = "mp4" if ffmpeg_input != gif_path else "gif"
 
-    # Order of preference for ffmpeg executable:
-    # 1. Environment variable `SHRINK_FFMPEG_EXE`
-    # 2. Repo-local `bin/ffmpeg` (preferred)
-    # 3. System `ffmpeg` on PATH
-    ffmpeg_exe = os.environ.get("SHRINK_FFMPEG_EXE")
-    if ffmpeg_exe and not os.path.exists(ffmpeg_exe):
-        ffmpeg_exe = None
-
-    if not ffmpeg_exe:
-        # Check common repo-relative bin locations robustly
-        try:
-            file_path = Path(__file__).resolve()
-            candidates = [
-                file_path.parent / "bin",
-                file_path.parent.parent / "bin",
-                file_path.parent.parent.parent / "bin",
-            ]
-            for c in candidates:
-                candidate = c / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
-                if candidate.exists():
-                    ffmpeg_exe = str(candidate)
-                    break
-        except Exception:
-            pass
-
-    if not ffmpeg_exe:
-        ffmpeg_exe = shutil.which("ffmpeg")
+    ffmpeg_exe = resolve_ffmpeg_exe()
     # Prefer repo/bin/gifsicle, then env var SHRINK_GIFSICLE_EXE, then system gifsicle
     gifsicle_exe = os.environ.get("SHRINK_GIFSICLE_EXE")
     if gifsicle_exe and not os.path.exists(gifsicle_exe):
@@ -359,7 +367,7 @@ def shrink_gif_to_target(
                     else "scale=iw:ih:flags=lanczos"
                 )
                 tag = f'{fps}_{width or "orig"}'
-                palette_key = str(width or "orig")
+                palette_key = f'{width or "orig"}_{int(fps)}'
                 with palette_lock:
                     palette = palette_cache.get(palette_key)
                     if not palette:
@@ -867,50 +875,57 @@ def shrink_gif_to_target(
                 _emit_metrics("ok_cache", dst)
                 return dst
 
-            # First try original width (highest quality) with FPS binary search.
-            best_orig = _best_fps_path_for_width(None)
-            if best_orig:
-                best_orig_path, best_orig_fps = best_orig
-                name = os.path.splitext(os.path.basename(gif_path))[0]
-                dst = os.path.join(out_dir, f"{name}_small.gif")
-                shutil.move(best_orig_path, dst)
-                _cache_set(
-                    cache_key,
-                    None,
-                    best_orig_fps,
-                    alias_keys=[coarse_cache_key],
-                )
-                _emit_metrics("ok_ffmpeg", dst)
-                return dst
+            # Width-first search:
+            # 1) coarse/binary search max width that can fit at low FPS
+            # 2) run FPS fine search only once on the selected width
+            low_fps = 5
 
-            # If even the minimum width cannot satisfy target, fall through to gifsicle.
-            low_fit = _best_fps_path_for_width(min_width_effective)
-            if low_fit:
-                best_width_path, best_width_fps = low_fit
-                best_width_value = min_width_effective
+            def _width_fits_at_low_fps(width):
+                p = _produce(width, low_fps)
+                if not p:
+                    return False
+                if not _fits_target(p):
+                    return False
+                s = _path_size(p)
+                if s is not None and s > (target_bytes * width_prune_ratio):
+                    return False
+                return True
+
+            selected_width = None
+
+            # Try original width first at low FPS (best quality if it fits).
+            orig_low_fit = _width_fits_at_low_fps(None)
+            if orig_low_fit:
+                selected_width = None
+            elif _width_fits_at_low_fps(min_width_effective):
+                # Binary search the largest width that still fits at low FPS.
+                best_width = min_width_effective
                 lo = min_width_effective + 1
                 hi = hi_width
                 while lo <= hi:
                     mid = (lo + hi) // 2
-                    mid_fit = _best_fps_path_for_width(mid)
-                    if mid_fit:
-                        best_width_path, best_width_fps = mid_fit
-                        best_width_value = mid
+                    if _width_fits_at_low_fps(mid):
+                        best_width = mid
                         lo = mid + 1
                     else:
                         hi = mid - 1
+                selected_width = best_width
 
-                name = os.path.splitext(os.path.basename(gif_path))[0]
-                dst = os.path.join(out_dir, f"{name}_small.gif")
-                shutil.move(best_width_path, dst)
-                _cache_set(
-                    cache_key,
-                    best_width_value,
-                    best_width_fps,
-                    alias_keys=[coarse_cache_key],
-                )
-                _emit_metrics("ok_ffmpeg", dst)
-                return dst
+            if selected_width is not None or orig_low_fit:
+                final_fit = _best_fps_path_for_width(selected_width)
+                if final_fit:
+                    final_path, final_fps = final_fit
+                    name = os.path.splitext(os.path.basename(gif_path))[0]
+                    dst = os.path.join(out_dir, f"{name}_small.gif")
+                    shutil.move(final_path, dst)
+                    _cache_set(
+                        cache_key,
+                        selected_width,
+                        final_fps,
+                        alias_keys=[coarse_cache_key],
+                    )
+                    _emit_metrics("ok_ffmpeg", dst)
+                    return dst
 
         base_input = (
             best_candidate

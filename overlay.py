@@ -88,9 +88,9 @@ class OverlayWindow(QtWidgets.QWidget):
             for w in QtWidgets.QApplication.topLevelWidgets():
                 try:
                     if (
-                        getattr(w, "windowTitle", None)
-                        and w.windowTitle() == "Screen2GIF"
-                    ):
+                        getattr(w, "objectName", None)
+                        and w.objectName() == "Screen2GIFToolbar"
+                    ) or hasattr(w, "start_btn"):
                         try:
                             w.raise_()
                         except Exception:
