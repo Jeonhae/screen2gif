@@ -238,10 +238,10 @@ def shrink_gif_to_target(
             palette_lock = threading.Lock()
             try:
                 max_ffmpeg_variants = int(
-                    os.environ.get("SHRINK_MAX_FFMPEG_VARIANTS", "12")
+                    os.environ.get("SHRINK_MAX_FFMPEG_VARIANTS", "8")
                 )
             except Exception:
-                max_ffmpeg_variants = 12
+                max_ffmpeg_variants = 8
             max_ffmpeg_variants = max(1, max_ffmpeg_variants)
             ffmpeg_variants_tried = [0]
             try:
@@ -287,6 +287,13 @@ def shrink_gif_to_target(
                         cache_data = obj
             except Exception:
                 cache_data = {}
+            try:
+                blacklist_ttl_sec = int(
+                    os.environ.get("SHRINK_BLACKLIST_TTL_SEC", "900")
+                )
+            except Exception:
+                blacklist_ttl_sec = 900
+            blacklist_ttl_sec = max(60, blacklist_ttl_sec)
 
             def _run_palette(width, fps):
                 scale_expr = (
@@ -364,6 +371,63 @@ def shrink_gif_to_target(
                         "[shrink] early-stop triggered: low improvement streak reached"
                     )
 
+            def _persist_cache():
+                try:
+                    with open(cache_path, "w", encoding="utf-8") as cf:
+                        json.dump(cache_data, cf, ensure_ascii=False)
+                except Exception:
+                    pass
+
+            def _blacklist_key(width, fps):
+                return f"{'orig' if width is None else int(width)}:{int(fps)}"
+
+            def _blacklist_prune(now_ts: int):
+                bm = cache_data.get("__ffmpeg_blacklist")
+                if not isinstance(bm, dict):
+                    cache_data["__ffmpeg_blacklist"] = {}
+                    return
+                expired = []
+                for k, v in bm.items():
+                    try:
+                        ts = int(v)
+                    except Exception:
+                        expired.append(k)
+                        continue
+                    if now_ts - ts >= blacklist_ttl_sec:
+                        expired.append(k)
+                for k in expired:
+                    bm.pop(k, None)
+
+            def _blacklist_is_active(width, fps) -> bool:
+                now_ts = int(time.time())
+                _blacklist_prune(now_ts)
+                bm = cache_data.get("__ffmpeg_blacklist")
+                if not isinstance(bm, dict):
+                    return False
+                ts = bm.get(_blacklist_key(width, fps))
+                if ts is None:
+                    return False
+                try:
+                    return now_ts - int(ts) < blacklist_ttl_sec
+                except Exception:
+                    return False
+
+            def _blacklist_mark_failure(width, fps):
+                now_ts = int(time.time())
+                _blacklist_prune(now_ts)
+                bm = cache_data.get("__ffmpeg_blacklist")
+                if not isinstance(bm, dict):
+                    bm = {}
+                    cache_data["__ffmpeg_blacklist"] = bm
+                bm[_blacklist_key(width, fps)] = now_ts
+                _persist_cache()
+
+            def _blacklist_mark_success(width, fps):
+                bm = cache_data.get("__ffmpeg_blacklist")
+                if isinstance(bm, dict):
+                    bm.pop(_blacklist_key(width, fps), None)
+                _persist_cache()
+
             def _cache_set(cache_key: str, width, fps, alias_keys=None):
                 try:
                     entry = {
@@ -393,8 +457,10 @@ def shrink_gif_to_target(
                         },
                     )
                     cache_data["__recent_success"] = recent[:20]
-                    with open(cache_path, "w", encoding="utf-8") as cf:
-                        json.dump(cache_data, cf, ensure_ascii=False)
+                    bm = cache_data.get("__ffmpeg_blacklist")
+                    if isinstance(bm, dict):
+                        bm.pop(_blacklist_key(width, fps), None)
+                    _persist_cache()
                 except Exception:
                     pass
 
@@ -492,6 +558,28 @@ def shrink_gif_to_target(
                 scored.sort(key=lambda x: x[0])
                 return [x[1] for x in scored[:3]]
 
+            def _preferred_fps_from_recent(
+                src_tag: str, width_now: int, target_now: int, bucket_now: int
+            ) -> int:
+                items = _find_recent_cache_entries(
+                    src_tag, width_now, target_now, bucket_now
+                )
+                if not items:
+                    return 10
+                best_fps = None
+                for it in items:
+                    try:
+                        fps = int(it.get("fps", 10))
+                    except Exception:
+                        continue
+                    if best_fps is None:
+                        best_fps = fps
+                    else:
+                        best_fps = int(round((best_fps + fps) / 2.0))
+                if best_fps is None:
+                    return 10
+                return max(5, min(15, int(best_fps)))
+
             def _produce(width, fps):
                 key = (width, fps)
                 while True:
@@ -509,6 +597,9 @@ def shrink_gif_to_target(
                             ):
                                 produced[key] = None
                                 return None
+                            if _blacklist_is_active(width, fps):
+                                produced[key] = None
+                                return None
                             ffmpeg_variants_tried[0] += 1
                             produced[key] = "__RUNNING__"
                             wait_event = threading.Event()
@@ -521,6 +612,7 @@ def shrink_gif_to_target(
                     result = None
                     try:
                         result = _run_palette(width, fps)
+                        _blacklist_mark_success(width, fps)
                         try:
                             s = os.path.getsize(result) if result else None
                         except Exception:
@@ -529,6 +621,7 @@ def shrink_gif_to_target(
                             _update_early_stop(s)
                     except Exception:
                         result = None
+                        _blacklist_mark_failure(width, fps)
                     finally:
                         with state_lock:
                             produced[key] = result
@@ -573,7 +666,11 @@ def shrink_gif_to_target(
             def _best_fps_path_for_width(width):
                 high_fps = 15
                 low_fps = 5
-                coarse_fps = [high_fps, 10, low_fps]
+                w_now = hi_width if width is None else int(width)
+                pref_fps = _preferred_fps_from_recent(
+                    source_tag, w_now, int(target_bytes), size_bucket_now
+                )
+                coarse_fps = [high_fps, pref_fps, low_fps]
                 coarse_batch = _eval_fps_candidates(width, coarse_fps)
                 coarse_fit = []
                 coarse_nonfit = []
