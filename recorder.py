@@ -24,7 +24,6 @@ class ScreenRecorder:
         try:
             import os
             import json
-            import json
 
             dbgdir = os.path.join(os.path.dirname(__file__), "logs")
             os.makedirs(dbgdir, exist_ok=True)
@@ -95,11 +94,19 @@ class ScreenRecorder:
                 now = time.perf_counter()
                 if now - last_report >= 1.0:
                     try:
-                        avg_grab = sum(grab_times) / len(grab_times) if grab_times else 0.0
-                        avg_enc = sum(encode_times) / len(encode_times) if encode_times else 0.0
+                        avg_grab = (
+                            sum(grab_times) / len(grab_times) if grab_times else 0.0
+                        )
+                        avg_enc = (
+                            sum(encode_times) / len(encode_times)
+                            if encode_times
+                            else 0.0
+                        )
                         with open(perf_file, "a", encoding="utf-8") as pf:
                             pf.write(
-                                f"{time.time()} frames={frame_count} avg_grab_ms={avg_grab:.2f} avg_enc_ms={avg_enc:.2f}\n"
+                                f"{time.time()} frames={frame_count} "
+                                f"avg_grab_ms={avg_grab:.2f} "
+                                f"avg_enc_ms={avg_enc:.2f}\n"
                             )
                     except Exception:
                         pass
@@ -124,12 +131,15 @@ class ScreenRecorder:
                     writer.release()
             except Exception:
                 logging.exception("Failed to release video writer")
+            finally:
+                # Mark recorder as no longer running once the capture loop exits.
+                self._thread = None
 
     def start(
         self, rect: Tuple[int, int, int, int], fps: int = 10, out_path: str = None
     ):
-        if self._thread and self._thread.is_alive():
-            return
+        if self.is_recording():
+            return False
         self._stop_event.clear()
         self._rect = rect
         self._fps = fps
@@ -138,14 +148,34 @@ class ScreenRecorder:
             target=self._capture_loop, args=(rect, fps, self._out_path), daemon=True
         )
         self._thread.start()
+        return True
 
-    def stop(self):
-        if not self._thread:
-            return None
+    def is_recording(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
+    def request_stop(self) -> None:
         self._stop_event.set()
+
+    def wait_stopped(self, timeout: float = 5.0) -> bool:
+        thread = self._thread
+        if not thread:
+            return True
         try:
-            # avoid blocking forever; wait up to 2 seconds for clean shutdown
-            self._thread.join(timeout=2.0)
+            thread.join(timeout=timeout)
         except Exception:
             logging.exception("Exception while joining recorder thread")
-        return self._out_path
+            return False
+        if thread.is_alive():
+            logging.error("Recorder thread did not stop within %.1f seconds", timeout)
+            return False
+        self._thread = None
+        return True
+
+    def stop(self, timeout: float = 5.0):
+        if not self._thread:
+            return self._out_path, True
+        self.request_stop()
+        stopped_ok = self.wait_stopped(timeout=timeout)
+        if not stopped_ok:
+            logging.error("Recorder stop timed out; output may be incomplete")
+        return self._out_path, stopped_ok

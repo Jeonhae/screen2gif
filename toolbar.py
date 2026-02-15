@@ -1,5 +1,6 @@
-from PyQt5 import QtWidgets
+﻿from PyQt5 import QtWidgets
 from PyQt5 import QtCore
+import logging
 
 
 class ToolBar(QtWidgets.QWidget):
@@ -44,34 +45,34 @@ class ToolBar(QtWidgets.QWidget):
             try:
                 self.raise_()
             except Exception:
-                pass
+                logging.exception("Failed to raise toolbar window")
         except Exception:
-            pass
+            logging.exception("Failed to enforce toolbar top-most state")
 
     def moveEvent(self, event):
         try:
             super().moveEvent(event)
         except Exception:
-            pass
+            logging.exception("super().moveEvent failed")
         try:
             # Emit a moved signal so external logic can react.
             # This lets external code avoid overlapping the selection.
             self.moved.emit()
         except Exception:
-            pass
+            logging.exception("Failed to emit moved signal")
 
     def closeEvent(self, event):
         # Emit signal so main app can handle UI/state reset.
         # Let the main app decide whether to save/stop/quit.
-        # Do NOT call QApplication.quit() here — let the main handler
+        # Do NOT call QApplication.quit() here; let the main handler
         # control application shutdown.
         try:
             self.close_requested.emit()
         except Exception:
-            pass
+            logging.exception("Failed to emit close_requested signal")
         try:
             event.accept()
         except Exception:
-            pass
+            logging.exception("Failed to accept toolbar close event")
 
     # Countdown logic removed: Start triggers immediately.

@@ -62,7 +62,9 @@ def clear_video_folder(
     return removed, errors
 
 
-def clear_gif_folder(base_dir: Optional[str] = None) -> Tuple[List[str], List[Tuple[str, str]]]:
+def clear_gif_folder(
+    base_dir: Optional[str] = None,
+) -> Tuple[List[str], List[Tuple[str, str]]]:
     """Remove all files and subdirectories inside the project's `gif` folder.
 
     - Keeps the `gif` folder itself.
@@ -129,7 +131,10 @@ def shrink_gif_to_target(
                     metrics["result_size"] = os.path.getsize(result_path)
                 except Exception:
                     metrics["result_size"] = None
-            metrics["duration_ms"] = round((time.perf_counter() - run_started) * 1000.0, 2)
+            metrics["duration_ms"] = round(
+                (time.perf_counter() - run_started) * 1000.0,
+                2,
+            )
             log_dir = os.path.join(os.path.dirname(__file__), "logs")
             os.makedirs(log_dir, exist_ok=True)
             log_path = os.path.join(log_dir, "shrink_metrics.jsonl")
@@ -200,7 +205,11 @@ def shrink_gif_to_target(
     if not gifsicle_exe:
         try:
             file_path = Path(__file__).resolve()
-            candidates = [file_path.parent / "bin", file_path.parent.parent / "bin", file_path.parent.parent.parent / "bin"]
+            candidates = [
+                file_path.parent / "bin",
+                file_path.parent.parent / "bin",
+                file_path.parent.parent.parent / "bin",
+            ]
             for c in candidates:
                 candidate = c / ("gifsicle.exe" if os.name == "nt" else "gifsicle")
                 if candidate.exists():
@@ -265,8 +274,15 @@ def shrink_gif_to_target(
                 try:
                     dbgdir = os.path.join(os.path.dirname(__file__), "logs")
                     os.makedirs(dbgdir, exist_ok=True)
-                    with open(os.path.join(dbgdir, "shrink_perf.txt"), "a", encoding="utf-8") as pf:
-                        pf.write(f"{time.time()} cmd={' '.join(cmd)} duration_ms={(t1-t0)*1000:.1f}\n")
+                    with open(
+                        os.path.join(dbgdir, "shrink_perf.txt"),
+                        "a",
+                        encoding="utf-8",
+                    ) as pf:
+                        pf.write(
+                            f"{time.time()} cmd={' '.join(cmd)} "
+                            f"duration_ms={(t1 - t0) * 1000:.1f}\n"
+                        )
                 except Exception:
                     pass
 
@@ -734,7 +750,9 @@ def shrink_gif_to_target(
                 if not (low_path and _fits_target(low_path)):
                     return None
                 low_size = _path_size(low_path)
-                if low_size is not None and low_size > (target_bytes * width_prune_ratio):
+                if low_size is not None and low_size > (
+                    target_bytes * width_prune_ratio
+                ):
                     logging.debug(
                         "[shrink] prune width=%s: low_fps size=%s over ratio %.2f",
                         str(width),
@@ -792,7 +810,8 @@ def shrink_gif_to_target(
             min_width_effective = min_width if hi_width >= min_width else hi_width
             source_tag = "mp4" if ffmpeg_input != gif_path else "gif"
             cache_key = (
-                f"{source_tag}_w{hi_width}_t{int(target_bytes)}_b{int(orig_size // (256 * 1024))}"
+                f"{source_tag}_w{hi_width}_t{int(target_bytes)}"
+                f"_b{int(orig_size // (256 * 1024))}"
             )
             size_bucket_now = int(orig_size // (256 * 1024))
             coarse_width = int((hi_width // 160) * 160)
@@ -828,7 +847,9 @@ def shrink_gif_to_target(
                     if cached_path:
                         metrics["cache_hit"] = "neighbor"
                         logging.debug(
-                            "[shrink] cache near-hit: key=%s from=%s", cache_key, near_key
+                            "[shrink] cache near-hit: key=%s from=%s",
+                            cache_key,
+                            near_key,
                         )
             if not cached_path:
                 for recent_entry in _find_recent_cache_entries(
@@ -853,7 +874,12 @@ def shrink_gif_to_target(
                 name = os.path.splitext(os.path.basename(gif_path))[0]
                 dst = os.path.join(out_dir, f"{name}_small.gif")
                 shutil.move(best_orig_path, dst)
-                _cache_set(cache_key, None, best_orig_fps, alias_keys=[coarse_cache_key])
+                _cache_set(
+                    cache_key,
+                    None,
+                    best_orig_fps,
+                    alias_keys=[coarse_cache_key],
+                )
                 _emit_metrics("ok_ffmpeg", dst)
                 return dst
 
@@ -919,7 +945,9 @@ def shrink_gif_to_target(
         gifsicle_early_stop = False
 
         def _update_gifsicle_early_stop(size: Optional[int]) -> None:
-            nonlocal gifsicle_last_oversize, gifsicle_low_improve_streak, gifsicle_early_stop
+            nonlocal gifsicle_last_oversize
+            nonlocal gifsicle_low_improve_streak
+            nonlocal gifsicle_early_stop
             if size is None or size <= target_bytes:
                 return
             prev = gifsicle_last_oversize
@@ -936,13 +964,17 @@ def shrink_gif_to_target(
                 gifsicle_early_stop = True
                 metrics["gifsicle_early_stop"] = True
                 logging.debug(
-                    "[shrink] gifsicle early-stop triggered: low improvement streak reached"
+                    "[shrink] gifsicle early-stop triggered: "
+                    "low improvement streak reached"
                 )
 
         # gifsicle color reductions
         if gifsicle_exe:
             for colors in (256, 128, 64, 32, 16, 8):
-                if gifsicle_early_stop or gifsicle_variants_tried >= max_gifsicle_variants:
+                if (
+                    gifsicle_early_stop
+                    or gifsicle_variants_tried >= max_gifsicle_variants
+                ):
                     break
                 out_gif = os.path.join(tmpdir, f"g_colors_{colors}.gif")
                 try:
@@ -978,7 +1010,10 @@ def shrink_gif_to_target(
         # gifsicle lossy fallback
         if gifsicle_exe:
             for lossy in (40, 80, 120, 160, 200, 300, 400):
-                if gifsicle_early_stop or gifsicle_variants_tried >= max_gifsicle_variants:
+                if (
+                    gifsicle_early_stop
+                    or gifsicle_variants_tried >= max_gifsicle_variants
+                ):
                     break
                 out_gif = os.path.join(tmpdir, f"g_lossy_{lossy}.gif")
                 try:

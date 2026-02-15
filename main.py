@@ -1,4 +1,4 @@
-import sys
+﻿import sys
 import traceback
 import os
 import time
@@ -137,7 +137,7 @@ def show_topmost_message(
                             pass
                         break
             except Exception:
-                pass
+                logging.exception("Failed to restore toolbar focus after message")
 
             return ret
     except Exception:
@@ -275,7 +275,7 @@ def monitor_check(ctx):
     try:
         recorder = ctx.recorder
         toolbar = ctx.toolbar
-        if getattr(recorder, "_thread", None) and recorder._thread.is_alive():
+        if recorder.is_recording():
             if not toolbar.isVisible():
                 try:
                     dbgdir = os.path.join(os.path.dirname(__file__), "logs")
@@ -326,6 +326,112 @@ def _process_ui_events_wait(ms: int = 120):
         logging.exception("_process_ui_events_wait failed")
 
 
+class GifConversionWorker(QtCore.QObject):
+    """Background worker: convert MP4 to GIF and shrink to target size."""
+
+    finished = QtCore.pyqtSignal(dict)
+
+    def __init__(self, mp4_path: str, target_bytes: int):
+        super().__init__()
+        self._mp4_path = mp4_path
+        self._target_bytes = target_bytes
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        result = {"ok": False, "gif_path": None, "error": "Unknown conversion error"}
+        try:
+            clear_gif_folder()
+            gif_path = timestamped_filename("gif", "gif")
+            ok = convert_mp4_to_gif(self._mp4_path, gif_path, fps=10)
+            if not ok:
+                result["error"] = "Failed to convert to GIF"
+                self.finished.emit(result)
+                return
+
+            small_dir = os.path.join(os.path.dirname(__file__), "smallGif")
+            orig_size = os.path.getsize(gif_path)
+            if orig_size <= self._target_bytes:
+                os.makedirs(small_dir, exist_ok=True)
+                dst = os.path.join(small_dir, os.path.basename(gif_path))
+                shutil.copy2(gif_path, dst)
+                final_path = dst
+            else:
+                shrunk = shrink_gif_to_target(
+                    gif_path,
+                    self._target_bytes,
+                    small_dir,
+                    source_mp4_path=self._mp4_path,
+                )
+                final_path = shrunk or gif_path
+
+            result = {"ok": True, "gif_path": final_path, "error": None}
+        except Exception as e:
+            logging.exception("GIF conversion worker failed")
+            result["error"] = str(e)
+        self.finished.emit(result)
+
+
+class MainThreadDispatcher(QtCore.QObject):
+    """Bridge worker-thread completion into the GUI thread explicitly."""
+
+    conversion_result = QtCore.pyqtSignal(dict)
+
+    @QtCore.pyqtSlot(dict)
+    def forward_conversion_result(self, result: dict):
+        self.conversion_result.emit(result)
+
+
+def _finalize_conversion_result(ctx, result):
+    """Handle conversion result on the main/UI thread."""
+    thread = getattr(ctx, "conversion_thread", None)
+    ctx.conversion_in_progress = False
+    try:
+        if thread and thread.isRunning():
+            thread.quit()
+            thread.wait(2000)
+    except Exception:
+        logging.exception("Failed to stop conversion thread")
+    finally:
+        ctx.conversion_worker = None
+        ctx.conversion_thread = None
+
+    try:
+        if result.get("ok") and result.get("gif_path"):
+            gif_path = result["gif_path"]
+            copied_ok = bool(copy_path_to_clipboard(gif_path))
+            if copied_ok:
+                show_topmost_message(
+                    None,
+                    "Success",
+                    "GIF generated and copied to clipboard.\n"
+                    f"Path: {gif_path}\nPress Ctrl+V to paste.",
+                    icon=QtWidgets.QMessageBox.Information,
+                )
+            else:
+                show_topmost_message(
+                    None,
+                    "GIF generated",
+                    "GIF generated, but failed to copy to clipboard.\n"
+                    f"Path: {gif_path}",
+                    icon=QtWidgets.QMessageBox.Warning,
+                )
+        else:
+            err_text = result.get("error") or "Failed to convert to GIF"
+            show_topmost_message(
+                None,
+                "Error",
+                err_text,
+                icon=QtWidgets.QMessageBox.Warning,
+            )
+    except Exception:
+        logging.exception("Failed to finalize conversion result in UI")
+    finally:
+        try:
+            ctx.return_to_main()
+        except Exception:
+            logging.exception("return_to_main failed at end of stop_recording_flow")
+
+
 def start_recording_flow(ctx, rect):
     """Module-level flow to start recording given a context and selection rect.
 
@@ -336,6 +442,15 @@ def start_recording_flow(ctx, rect):
     toolbar = ctx.toolbar
     recorder = ctx.recorder
     visibility_monitor = ctx.visibility_monitor
+
+    if getattr(ctx, "conversion_in_progress", False):
+        show_topmost_message(
+            None,
+            "Please wait",
+            "GIF is still being processed. Try again after conversion finishes.",
+            icon=QtWidgets.QMessageBox.Information,
+        )
+        return
 
     x, y, w, h = rect
     output_mp4 = timestamped_filename("video", "mp4")
@@ -373,9 +488,9 @@ def start_recording_flow(ctx, rect):
         logging.exception("overlay.start_recording failed in start_recording_flow")
 
     try:
-        recorder.start((x, y, w, h), fps=10, out_path=output_mp4)
+        started = recorder.start((x, y, w, h), fps=10, out_path=output_mp4)
         _process_ui_events_wait(120)
-        if not (getattr(recorder, "_thread", None) and recorder._thread.is_alive()):
+        if (not started) or (not recorder.is_recording()):
             try:
                 show_topmost_message(
                     None,
@@ -419,7 +534,16 @@ def stop_recording_flow(ctx):
     recorder = ctx.recorder
     visibility_monitor = ctx.visibility_monitor
 
-    mp4_path = recorder.stop()
+    if getattr(ctx, "conversion_in_progress", False):
+        show_topmost_message(
+            None,
+            "Please wait",
+            "GIF is still being processed. Please wait until it completes.",
+            icon=QtWidgets.QMessageBox.Information,
+        )
+        return
+
+    mp4_path, stopped_ok = recorder.stop(timeout=5.0)
     try:
         visibility_monitor.stop()
     except Exception:
@@ -451,6 +575,22 @@ def stop_recording_flow(ctx):
     except Exception:
         logging.exception("Unexpected error in stop_recording_flow platform logic")
 
+    if not stopped_ok:
+        show_topmost_message(
+            None,
+            "Error",
+            (
+                "Recorder did not stop cleanly. Conversion was skipped "
+                "to avoid corrupted GIF output."
+            ),
+            icon=QtWidgets.QMessageBox.Warning,
+        )
+        try:
+            ctx.return_to_main()
+        except Exception:
+            logging.exception("return_to_main failed after recorder stop timeout")
+        return
+
     if not mp4_path:
         try:
             show_topmost_message(
@@ -467,81 +607,22 @@ def stop_recording_flow(ctx):
             logging.exception("return_to_main failed in stop_recording_flow")
         return
 
-    # clear previous GIFs before creating a new one
-    try:
-        clear_gif_folder()
-    except Exception:
-        logging.exception("Failed to clear gif folder before writing new GIF")
+    ctx.conversion_in_progress = True
 
-    gif_path = timestamped_filename("gif", "gif")
-    ok = convert_mp4_to_gif(mp4_path, gif_path, fps=10)
-    if ok:
-        try:
-            try:
-                orig_size = os.path.getsize(gif_path)
-            except Exception:
-                orig_size = 0
+    worker = GifConversionWorker(mp4_path, DEFAULT_GIF_TARGET_BYTES)
+    thread = QtCore.QThread()
+    worker.moveToThread(thread)
+    ctx.conversion_worker = worker
+    ctx.conversion_thread = thread
 
-            small_dir = os.path.join(os.path.dirname(__file__), "smallGif")
-            if orig_size <= DEFAULT_GIF_TARGET_BYTES:
-                try:
-                    os.makedirs(small_dir, exist_ok=True)
-                    dst = os.path.join(small_dir, os.path.basename(gif_path))
-                    shutil.copy2(gif_path, dst)
-                    gif_path = dst
-                except Exception:
-                    logging.exception("Failed copying small GIF to smallGif")
-            else:
-                try:
-                    shr = shrink_gif_to_target(
-                        gif_path,
-                        DEFAULT_GIF_TARGET_BYTES,
-                        small_dir,
-                        source_mp4_path=mp4_path,
-                    )
-                    if shr:
-                        gif_path = shr
-                except Exception:
-                    logging.exception("GIF shrinking failed in stop_recording_flow")
-        except Exception:
-            logging.exception("GIF shrinking failed in stop_recording_flow")
-        copied_ok = False
-        try:
-            copied_ok = bool(copy_path_to_clipboard(gif_path))
-        except Exception:
-            logging.exception("copy_path_to_clipboard failed in stop_recording_flow")
-        try:
-            if copied_ok:
-                show_topmost_message(
-                    None,
-                    "Success",
-                    f"GIF generated and copied to clipboard.\nPath: {gif_path}\nPress Ctrl+V to paste.",
-                    icon=QtWidgets.QMessageBox.Information,
-                )
-            else:
-                show_topmost_message(
-                    None,
-                    "GIF generated",
-                    f"GIF generated, but failed to copy to clipboard.\nPath: {gif_path}",
-                    icon=QtWidgets.QMessageBox.Warning,
-                )
-        except Exception:
-            logging.exception("show_topmost_message failed after convert")
-    else:
-        try:
-            show_topmost_message(
-                None,
-                "Error",
-                "Failed to convert to GIF",
-                icon=QtWidgets.QMessageBox.Warning,
-            )
-        except Exception:
-            logging.exception("show_topmost_message failed on convert error")
-
-    try:
-        ctx.return_to_main()
-    except Exception:
-        logging.exception("return_to_main failed at end of stop_recording_flow")
+    worker.finished.connect(
+        ctx.dispatcher.forward_conversion_result,
+        QtCore.Qt.QueuedConnection,
+    )
+    worker.finished.connect(worker.deleteLater)
+    thread.finished.connect(thread.deleteLater)
+    thread.started.connect(worker.run)
+    thread.start()
 
 
 def main():
@@ -566,15 +647,23 @@ def main():
     # Ensure recorder thread is stopped when the application is quitting
     def _on_about_to_quit():
         try:
-            if getattr(recorder, "_thread", None) and recorder._thread.is_alive():
-                recorder._stop_event.set()
-                recorder._thread.join(timeout=1)
+            if recorder.is_recording():
+                recorder.request_stop()
+                if not recorder.wait_stopped(timeout=1.0):
+                    logging.warning("Recorder did not stop cleanly during aboutToQuit")
         except Exception:
-            pass
+            logging.exception("Failed while stopping recorder in aboutToQuit")
+        try:
+            t = getattr(_ctx, "conversion_thread", None)
+            if t and t.isRunning():
+                t.quit()
+                t.wait(2000)
+        except Exception:
+            logging.exception("Failed stopping conversion thread in aboutToQuit")
         try:
             _visibility_monitor.stop()
         except Exception:
-            pass
+            logging.exception("Failed to stop visibility monitor in aboutToQuit")
 
     try:
         app.aboutToQuit.connect(_on_about_to_quit)
@@ -607,15 +696,15 @@ def main():
             try:
                 self.setWindowFlag(QtCore.Qt.WindowMaximizeButtonHint, False)
             except Exception:
-                pass
+                logging.exception("Failed to disable maximize button on initial window")
             layout = QtWidgets.QVBoxLayout()
             # author/credit label above the main instruction
             try:
-                self.by_label = QtWidgets.QLabel("By译路同行")
+                self.by_label = QtWidgets.QLabel("By 译路同行")
                 self.by_label.setAlignment(QtCore.Qt.AlignCenter)
                 layout.addWidget(self.by_label)
             except Exception:
-                pass
+                logging.exception("Failed to initialize author label")
             self.label = QtWidgets.QLabel("点击下方按钮进入录制模式")
             self.label.setAlignment(QtCore.Qt.AlignCenter)
             self.record_btn = QtWidgets.QPushButton("录制")
@@ -640,13 +729,15 @@ def main():
             if inst and inst.closingDown():
                 return
         except Exception:
-            pass
-        if getattr(recorder, "_thread", None) and recorder._thread.is_alive():
-            recorder.stop()
+            logging.exception("Failed to inspect app closing state in return_to_main")
+        if recorder.is_recording():
+            _, stopped_ok = recorder.stop(timeout=2.0)
+            if not stopped_ok:
+                logging.warning("Recorder did not stop cleanly in return_to_main")
         try:
             _visibility_monitor.stop()
         except Exception:
-            pass
+            logging.exception("Failed stopping visibility monitor in return_to_main")
         try:
             _countdown_timer.stop()
         except Exception:
@@ -660,7 +751,7 @@ def main():
             toolbar.start_btn.setEnabled(True)
             toolbar.start_btn.setText("Start")
         except Exception:
-            pass
+            logging.exception("Failed resetting UI state in return_to_main")
 
         initial.showNormal()
         initial.raise_()
@@ -685,12 +776,19 @@ def main():
     _ctx.visibility_monitor = _visibility_monitor
     _ctx.countdown_timer = _countdown_timer
     _ctx.return_to_main = _return_to_main
+    _ctx.conversion_in_progress = False
+    _ctx.conversion_worker = None
+    _ctx.conversion_thread = None
+    _ctx.dispatcher = MainThreadDispatcher()
+    _ctx.dispatcher.conversion_result.connect(
+        lambda result: _finalize_conversion_result(_ctx, result)
+    )
 
     try:
         try:
             _visibility_monitor.timeout.disconnect()
         except Exception:
-            pass
+            logging.exception("Failed to disconnect visibility monitor timeout")
         _visibility_monitor.timeout.connect(lambda: monitor_check(_ctx))
     except Exception:
         logging.exception("Failed to connect visibility monitor")
@@ -704,20 +802,30 @@ def main():
         try:
             _countdown_timer.stop()
         except Exception:
-            pass
+            logging.exception("Failed to stop countdown timer during shutdown")
         try:
             _visibility_monitor.stop()
         except Exception:
-            pass
+            logging.exception("Failed to stop visibility monitor during shutdown")
         try:
-            if getattr(recorder, "_thread", None) and recorder._thread.is_alive():
-                recorder.stop()
+            if recorder.is_recording():
+                _, stopped_ok = recorder.stop(timeout=2.0)
+                if not stopped_ok:
+                    logging.warning("Recorder did not stop cleanly during shutdown")
         except Exception:
             logging.exception("Exception while stopping recorder during shutdown")
         try:
             overlay.stop_recording()
         except Exception:
             logging.exception("overlay.stop_recording() failed during shutdown")
+        try:
+            t = _ctx.conversion_thread
+            if t and t.isRunning():
+                t.quit()
+                t.wait(2000)
+            _ctx.conversion_in_progress = False
+        except Exception:
+            logging.exception("Failed stopping conversion thread during shutdown")
         try:
             overlay.hide()
             toolbar.hide()
@@ -730,7 +838,7 @@ def main():
             try:
                 sys.exit(0)
             except Exception:
-                pass
+                logging.exception("Failed to exit process during shutdown")
 
     def _handle_start_clicked():
         # If overlay is hidden for some reason, just show it
@@ -745,7 +853,11 @@ def main():
                 try:
                     # On Windows, prefer a native topmost MessageBox as a fallback.
                     # Some window managers may keep toolbar above Qt dialogs.
-                    show_topmost_message(overlay, "提示", "请先按住鼠标左键拖曳绘制矩形框。")
+                    show_topmost_message(
+                        overlay,
+                        "提示",
+                        "请先按住鼠标左键拖曳绘制矩形框。",
+                    )
                 except Exception:
                     logging.exception("show_topmost_message failed")
                 return
@@ -757,7 +869,7 @@ def main():
             _countdown_timer.stop()
             _countdown_timer.timeout.disconnect()
         except Exception:
-            pass
+            logging.exception("Failed to reset countdown timer on start click")
         toolbar.start_btn.setEnabled(False)
         toolbar.start_btn.setText("Recording...")
 
@@ -777,12 +889,12 @@ def main():
             toolbar.raise_()
             toolbar.activateWindow()
         except Exception:
-            pass
+            logging.exception("Failed to show/activate toolbar on start")
         # hide the initial launcher window
         try:
             initial.hide()
         except Exception:
-            pass
+            logging.exception("Failed to hide initial window on start")
 
         # No default selection: require the user to draw a rectangle before starting
 
@@ -791,10 +903,10 @@ def main():
     def on_stop_clicked():
         # If recorder is active, perform normal stop
         try:
-            if getattr(recorder, "_thread", None) and recorder._thread.is_alive():
+            if recorder.is_recording():
                 return on_stop()
         except Exception:
-            pass
+            logging.exception("Failed checking recorder state in on_stop_clicked")
 
         # If the overlay's red selection box is not blinking (not recording),
         # prompt the user to press Start first.
@@ -811,10 +923,10 @@ def main():
                         buttons=QtWidgets.QMessageBox.Ok,
                     )
                 except Exception:
-                    pass
+                    logging.exception("Failed to show stop hint message")
                 return
         except Exception:
-            pass
+            logging.exception("Failed to check recording-active state on stop")
 
         # Not recording: if overlay is visible but no selection drawn, prompt user
         try:
@@ -836,31 +948,34 @@ def main():
                             try:
                                 toolbar.start_btn.setFocus()
                             except Exception:
-                                pass
+                                logging.exception("Failed to focus start button")
                         except Exception:
-                            pass
+                            logging.exception(
+                                "Failed to reactivate toolbar on stop hint"
+                            )
                 except Exception:
-                    pass
+                    logging.exception("Failed to show stop hint dialog")
                 return
         except Exception:
-            pass
+            logging.exception("Failed to validate selection state on stop")
 
         # Fallback: call on_stop to ensure consistent behavior
         try:
             on_stop()
         except Exception:
-            pass
+            logging.exception("Fallback stop handler failed")
 
     toolbar.stop_requested.connect(on_stop_clicked)
 
     def _handle_toolbar_close():
         try:
-            # If recording is active: stop and discard recorded content, then return to main
-            if getattr(recorder, "_thread", None) and recorder._thread.is_alive():
+            # If recording is active, stop and discard recorded content,
+            # then return to main.
+            if recorder.is_recording():
                 try:
                     mp4_path = None
                     try:
-                        mp4_path = recorder.stop()
+                        mp4_path, _ = recorder.stop(timeout=2.0)
                     except Exception:
                         mp4_path = None
                     # remove temporary mp4 if exists
@@ -868,16 +983,18 @@ def main():
                         try:
                             os.remove(mp4_path)
                         except Exception:
-                            pass
+                            logging.exception("Failed removing temporary mp4 on close")
                 except Exception:
-                    pass
+                    logging.exception("Failed to stop recorder during toolbar close")
                 try:
                     _return_to_main()
                 except Exception:
                     try:
                         _shutdown_app()
                     except Exception:
-                        pass
+                        logging.exception(
+                            "Failed to shutdown after close while recording"
+                        )
                 return
 
             # Not recording: return to initial window
@@ -887,12 +1004,12 @@ def main():
                 try:
                     _shutdown_app()
                 except Exception:
-                    pass
+                    logging.exception("Failed to shutdown after close while idle")
         except Exception:
             try:
                 _shutdown_app()
             except Exception:
-                pass
+                logging.exception("Failed to shutdown app after toolbar close error")
 
     toolbar.close_requested.connect(_handle_toolbar_close)
 
@@ -933,7 +1050,7 @@ def main():
                 try:
                     overlay.update()
                 except Exception:
-                    pass
+                    logging.exception("overlay.update failed in _enter_record_mode")
             except Exception:
                 logging.exception("Failed to create default centered selection")
         except Exception:
@@ -944,12 +1061,12 @@ def main():
             toolbar.raise_()
             toolbar.activateWindow()
         except Exception:
-            pass
+            logging.exception("Failed to show toolbar in _enter_record_mode")
         # hide the initial launcher window
         try:
             initial.hide()
         except Exception:
-            pass
+            logging.exception("Failed to hide initial window in _enter_record_mode")
 
         # No default selection: require the user to draw a rectangle before starting
 
@@ -986,10 +1103,14 @@ def main():
                             except Exception:
                                 pan_global_rect = None
 
-                            # If toolbar intersects neither the selection nor the pan handle, nothing to do
+                            # If toolbar intersects neither selection nor pan handle,
+                            # no repositioning is needed.
                             if (
                                 not sel_global.intersects(tb_rect)
-                                and not (pan_global_rect and pan_global_rect.intersects(tb_rect))
+                                and not (
+                                    pan_global_rect
+                                    and pan_global_rect.intersects(tb_rect)
+                                )
                             ):
                                 return
 
@@ -1024,7 +1145,10 @@ def main():
                                 # ensure candidate doesn't overlap pan handle
                                 try:
                                     cand_rect = QtCore.QRect(ax, ay, tb_w, tb_h)
-                                    if not (pan_global_rect and pan_global_rect.intersects(cand_rect)):
+                                    if not (
+                                        pan_global_rect
+                                        and pan_global_rect.intersects(cand_rect)
+                                    ):
                                         candidates.append(QtCore.QPoint(ax, ay))
                                 except Exception:
                                     candidates.append(QtCore.QPoint(ax, ay))
@@ -1038,7 +1162,10 @@ def main():
                             if rx + tb_w <= avail.x() + avail.width() - margin:
                                 try:
                                     cand_rect = QtCore.QRect(rx, ry, tb_w, tb_h)
-                                    if not (pan_global_rect and pan_global_rect.intersects(cand_rect)):
+                                    if not (
+                                        pan_global_rect
+                                        and pan_global_rect.intersects(cand_rect)
+                                    ):
                                         candidates.append(QtCore.QPoint(rx, ry))
                                 except Exception:
                                     candidates.append(QtCore.QPoint(rx, ry))
@@ -1048,7 +1175,10 @@ def main():
                             if by + tb_h <= avail.y() + avail.height() - margin:
                                 try:
                                     cand_rect = QtCore.QRect(bx, by, tb_w, tb_h)
-                                    if not (pan_global_rect and pan_global_rect.intersects(cand_rect)):
+                                    if not (
+                                        pan_global_rect
+                                        and pan_global_rect.intersects(cand_rect)
+                                    ):
                                         candidates.append(QtCore.QPoint(bx, by))
                                 except Exception:
                                     candidates.append(QtCore.QPoint(bx, by))
@@ -1058,7 +1188,10 @@ def main():
                             if lx >= avail.x() + margin:
                                 try:
                                     cand_rect = QtCore.QRect(lx, ly, tb_w, tb_h)
-                                    if not (pan_global_rect and pan_global_rect.intersects(cand_rect)):
+                                    if not (
+                                        pan_global_rect
+                                        and pan_global_rect.intersects(cand_rect)
+                                    ):
                                         candidates.append(QtCore.QPoint(lx, ly))
                                 except Exception:
                                     candidates.append(QtCore.QPoint(lx, ly))

@@ -51,7 +51,10 @@ def convert_mp4_to_gif(mp4_path: str, gif_path: str, fps: int = 10) -> bool:
                 stderr=subprocess.DEVNULL,
             )
             subprocess.run(
-                gif_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                gif_cmd,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
             return True
         except subprocess.CalledProcessError:
@@ -69,16 +72,23 @@ def convert_mp4_to_gif(mp4_path: str, gif_path: str, fps: int = 10) -> bool:
 
     # Fallback: use imageio to read video and write GIF
     reader = None
+    writer = None
     try:
         reader = imageio.get_reader(mp4_path)
-        frames = [frame for frame in reader]
-        if not frames:
-            return False
-        imageio.mimsave(gif_path, frames, fps=fps)
-        return True
+        writer = imageio.get_writer(gif_path, mode="I", fps=fps)
+        frame_count = 0
+        for frame in reader:
+            writer.append_data(frame)
+            frame_count += 1
+        return frame_count > 0
     except Exception:
         return False
     finally:
+        try:
+            if writer is not None:
+                writer.close()
+        except Exception:
+            pass
         try:
             if reader is not None:
                 reader.close()
