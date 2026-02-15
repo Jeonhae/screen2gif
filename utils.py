@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import shutil
 import subprocess
 import tempfile
@@ -230,6 +231,35 @@ def shrink_gif_to_target(
                 max_ffmpeg_variants = 12
             max_ffmpeg_variants = max(1, max_ffmpeg_variants)
             ffmpeg_variants_tried = [0]
+            try:
+                early_stop_min_improve = float(
+                    os.environ.get("SHRINK_EARLY_STOP_MIN_IMPROVE", "0.02")
+                )
+            except Exception:
+                early_stop_min_improve = 0.02
+            try:
+                early_stop_streak_limit = int(
+                    os.environ.get("SHRINK_EARLY_STOP_STREAK", "2")
+                )
+            except Exception:
+                early_stop_streak_limit = 2
+            early_stop_min_improve = max(0.0, early_stop_min_improve)
+            early_stop_streak_limit = max(1, early_stop_streak_limit)
+            early_stop_triggered = [False]
+            last_oversize = [None]
+            low_improve_streak = [0]
+
+            cache_path = os.path.join(
+                os.path.dirname(__file__), "logs", "shrink_param_cache.json"
+            )
+            cache_data = {}
+            try:
+                with open(cache_path, "r", encoding="utf-8") as cf:
+                    obj = json.load(cf)
+                    if isinstance(obj, dict):
+                        cache_data = obj
+            except Exception:
+                cache_data = {}
 
             def _run_palette(width, fps):
                 scale_expr = (
@@ -287,16 +317,55 @@ def shrink_gif_to_target(
                 _consider(path)
                 return size <= target_bytes
 
+            def _update_early_stop(size: Optional[int]):
+                if size is None or size <= target_bytes:
+                    return
+                prev = last_oversize[0]
+                if prev is not None and prev > 0 and size < prev:
+                    improve = float(prev - size) / float(prev)
+                    if improve < early_stop_min_improve:
+                        low_improve_streak[0] += 1
+                    else:
+                        low_improve_streak[0] = 0
+                else:
+                    low_improve_streak[0] = 0
+                last_oversize[0] = size
+                if low_improve_streak[0] >= early_stop_streak_limit:
+                    early_stop_triggered[0] = True
+                    logging.debug(
+                        "[shrink] early-stop triggered: low improvement streak reached"
+                    )
+
+            def _cache_set(cache_key: str, width, fps):
+                try:
+                    cache_data[cache_key] = {
+                        "width": ("orig" if width is None else int(width)),
+                        "fps": int(fps),
+                        "ts": int(time.time()),
+                    }
+                    with open(cache_path, "w", encoding="utf-8") as cf:
+                        json.dump(cache_data, cf, ensure_ascii=False)
+                except Exception:
+                    pass
+
             def _produce(width, fps):
                 key = (width, fps)
                 if key in produced:
                     return produced[key]
+                if early_stop_triggered[0]:
+                    produced[key] = None
+                    return None
                 if ffmpeg_variants_tried[0] >= max_ffmpeg_variants:
                     produced[key] = None
                     return None
                 try:
                     ffmpeg_variants_tried[0] += 1
                     produced[key] = _run_palette(width, fps)
+                    try:
+                        s = os.path.getsize(produced[key]) if produced[key] else None
+                    except Exception:
+                        s = None
+                    _update_early_stop(s)
                 except Exception:
                     produced[key] = None
                 return produced[key]
@@ -307,13 +376,14 @@ def shrink_gif_to_target(
 
                 high_path = _produce(width, high_fps)
                 if high_path and _fits_target(high_path):
-                    return high_path
+                    return high_path, high_fps
 
                 low_path = _produce(width, low_fps)
                 if not (low_path and _fits_target(low_path)):
                     return None
 
                 best_fit_path = low_path
+                best_fit_fps = low_fps
                 lo = low_fps + 1
                 hi = high_fps - 1
                 while lo <= hi:
@@ -324,10 +394,11 @@ def shrink_gif_to_target(
                         continue
                     if _fits_target(mid_path):
                         best_fit_path = mid_path
+                        best_fit_fps = mid
                         lo = mid + 1
                     else:
                         hi = mid - 1
-                return best_fit_path
+                return best_fit_path, best_fit_fps
 
             def _probe_gif_width(path):
                 reader = None
@@ -348,29 +419,55 @@ def shrink_gif_to_target(
                         pass
                 return None
 
-            # First try original width (highest quality) with FPS binary search.
-            best_orig = _best_fps_path_for_width(None)
-            if best_orig:
-                name = os.path.splitext(os.path.basename(gif_path))[0]
-                dst = os.path.join(out_dir, f"{name}_small.gif")
-                shutil.move(best_orig, dst)
-                return dst
-
             src_width = _probe_gif_width(gif_path)
             hi_width = int(src_width) if src_width else 800
             min_width_effective = min_width if hi_width >= min_width else hi_width
+            cache_key = (
+                f"w{hi_width}_t{int(target_bytes)}_b{int(orig_size // (256 * 1024))}"
+            )
+
+            cached_entry = cache_data.get(cache_key)
+            if isinstance(cached_entry, dict):
+                try:
+                    c_width = cached_entry.get("width")
+                    c_fps = int(cached_entry.get("fps"))
+                    if c_width == "orig":
+                        c_width = None
+                    else:
+                        c_width = int(c_width)
+                    cached_path = _produce(c_width, c_fps)
+                    if cached_path and _fits_target(cached_path):
+                        name = os.path.splitext(os.path.basename(gif_path))[0]
+                        dst = os.path.join(out_dir, f"{name}_small.gif")
+                        shutil.move(cached_path, dst)
+                        _cache_set(cache_key, c_width, c_fps)
+                        return dst
+                except Exception:
+                    pass
+
+            # First try original width (highest quality) with FPS binary search.
+            best_orig = _best_fps_path_for_width(None)
+            if best_orig:
+                best_orig_path, best_orig_fps = best_orig
+                name = os.path.splitext(os.path.basename(gif_path))[0]
+                dst = os.path.join(out_dir, f"{name}_small.gif")
+                shutil.move(best_orig_path, dst)
+                _cache_set(cache_key, None, best_orig_fps)
+                return dst
 
             # If even the minimum width cannot satisfy target, fall through to gifsicle.
             low_fit = _best_fps_path_for_width(min_width_effective)
             if low_fit:
-                best_width_path = low_fit
+                best_width_path, best_width_fps = low_fit
+                best_width_value = min_width_effective
                 lo = min_width_effective + 1
                 hi = hi_width
                 while lo <= hi:
                     mid = (lo + hi) // 2
                     mid_fit = _best_fps_path_for_width(mid)
                     if mid_fit:
-                        best_width_path = mid_fit
+                        best_width_path, best_width_fps = mid_fit
+                        best_width_value = mid
                         lo = mid + 1
                     else:
                         hi = mid - 1
@@ -378,6 +475,7 @@ def shrink_gif_to_target(
                 name = os.path.splitext(os.path.basename(gif_path))[0]
                 dst = os.path.join(out_dir, f"{name}_small.gif")
                 shutil.move(best_width_path, dst)
+                _cache_set(cache_key, best_width_value, best_width_fps)
                 return dst
 
         base_input = (
