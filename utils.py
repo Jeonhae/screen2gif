@@ -4,6 +4,8 @@ import json
 import shutil
 import subprocess
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Tuple
@@ -230,7 +232,10 @@ def shrink_gif_to_target(
         if ffmpeg_exe:
             min_width = 320
             produced = {}
+            produced_events = {}
             palette_cache = {}
+            state_lock = threading.Lock()
+            palette_lock = threading.Lock()
             try:
                 max_ffmpeg_variants = int(
                     os.environ.get("SHRINK_MAX_FFMPEG_VARIANTS", "12")
@@ -239,6 +244,20 @@ def shrink_gif_to_target(
                 max_ffmpeg_variants = 12
             max_ffmpeg_variants = max(1, max_ffmpeg_variants)
             ffmpeg_variants_tried = [0]
+            try:
+                ffmpeg_parallel_workers = int(
+                    os.environ.get("SHRINK_FFMPEG_PARALLEL_WORKERS", "2")
+                )
+            except Exception:
+                ffmpeg_parallel_workers = 2
+            ffmpeg_parallel_workers = max(1, min(3, ffmpeg_parallel_workers))
+            try:
+                width_prune_ratio = float(
+                    os.environ.get("SHRINK_WIDTH_PRUNE_RATIO", "1.8")
+                )
+            except Exception:
+                width_prune_ratio = 1.8
+            width_prune_ratio = max(1.0, width_prune_ratio)
             try:
                 early_stop_min_improve = float(
                     os.environ.get("SHRINK_EARLY_STOP_MIN_IMPROVE", "0.02")
@@ -277,24 +296,25 @@ def shrink_gif_to_target(
                 )
                 tag = f'{fps}_{width or "orig"}'
                 palette_key = str(width or "orig")
-                palette = palette_cache.get(palette_key)
-                if not palette:
-                    palette = os.path.join(tmpdir, f"palette_{palette_key}.png")
-                    _run_cmd_timed(
-                        [
-                            ffmpeg_exe,
-                            "-y",
-                            "-i",
-                            ffmpeg_input,
-                            "-vf",
-                            ("fps=" + str(fps) + "," + scale_expr + ",palettegen"),
-                            palette,
-                        ],
-                        check=True,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                    palette_cache[palette_key] = palette
+                with palette_lock:
+                    palette = palette_cache.get(palette_key)
+                    if not palette:
+                        palette = os.path.join(tmpdir, f"palette_{palette_key}.png")
+                        _run_cmd_timed(
+                            [
+                                ffmpeg_exe,
+                                "-y",
+                                "-i",
+                                ffmpeg_input,
+                                "-vf",
+                                ("fps=" + str(fps) + "," + scale_expr + ",palettegen"),
+                                palette,
+                            ],
+                            check=True,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        palette_cache[palette_key] = palette
                 out_gif = os.path.join(tmpdir, f"ff_{tag}.gif")
                 _run_cmd_timed(
                     [
@@ -358,36 +378,101 @@ def shrink_gif_to_target(
 
             def _produce(width, fps):
                 key = (width, fps)
-                if key in produced:
-                    return produced[key]
-                if early_stop_triggered[0]:
-                    produced[key] = None
-                    return None
-                if ffmpeg_variants_tried[0] >= max_ffmpeg_variants:
-                    produced[key] = None
+                while True:
+                    run_self = False
+                    wait_event = None
+                    with state_lock:
+                        if key in produced:
+                            val = produced[key]
+                            if val != "__RUNNING__":
+                                return val
+                            wait_event = produced_events.get(key)
+                        else:
+                            if early_stop_triggered[0] or (
+                                ffmpeg_variants_tried[0] >= max_ffmpeg_variants
+                            ):
+                                produced[key] = None
+                                return None
+                            ffmpeg_variants_tried[0] += 1
+                            produced[key] = "__RUNNING__"
+                            wait_event = threading.Event()
+                            produced_events[key] = wait_event
+                            run_self = True
+                    if not run_self:
+                        if wait_event is not None:
+                            wait_event.wait()
+                        continue
+                    result = None
+                    try:
+                        result = _run_palette(width, fps)
+                        try:
+                            s = os.path.getsize(result) if result else None
+                        except Exception:
+                            s = None
+                        with state_lock:
+                            _update_early_stop(s)
+                    except Exception:
+                        result = None
+                    finally:
+                        with state_lock:
+                            produced[key] = result
+                            ev = produced_events.pop(key, None)
+                            if ev is not None:
+                                ev.set()
+                    return result
+
+            def _path_size(path):
+                if not path:
                     return None
                 try:
-                    ffmpeg_variants_tried[0] += 1
-                    produced[key] = _run_palette(width, fps)
-                    try:
-                        s = os.path.getsize(produced[key]) if produced[key] else None
-                    except Exception:
-                        s = None
-                    _update_early_stop(s)
+                    return os.path.getsize(path)
                 except Exception:
-                    produced[key] = None
-                return produced[key]
+                    return None
+
+            def _eval_fps_candidates(width, fps_values):
+                uniq = []
+                seen = set()
+                for fps in fps_values:
+                    if fps in seen:
+                        continue
+                    seen.add(fps)
+                    uniq.append(fps)
+                results = {}
+                if ffmpeg_parallel_workers <= 1 or len(uniq) <= 1:
+                    for fps in uniq:
+                        results[fps] = _produce(width, fps)
+                    return results
+                with ThreadPoolExecutor(
+                    max_workers=min(ffmpeg_parallel_workers, len(uniq))
+                ) as ex:
+                    fut_map = {ex.submit(_produce, width, fps): fps for fps in uniq}
+                    for fut in as_completed(fut_map):
+                        fps = fut_map[fut]
+                        try:
+                            results[fps] = fut.result()
+                        except Exception:
+                            results[fps] = None
+                return results
 
             def _best_fps_path_for_width(width):
                 high_fps = 15
                 low_fps = 5
-
-                high_path = _produce(width, high_fps)
+                first_batch = _eval_fps_candidates(width, [high_fps, low_fps])
+                high_path = first_batch.get(high_fps)
                 if high_path and _fits_target(high_path):
                     return high_path, high_fps
 
-                low_path = _produce(width, low_fps)
+                low_path = first_batch.get(low_fps)
                 if not (low_path and _fits_target(low_path)):
+                    return None
+                low_size = _path_size(low_path)
+                if low_size is not None and low_size > (target_bytes * width_prune_ratio):
+                    logging.debug(
+                        "[shrink] prune width=%s: low_fps size=%s over ratio %.2f",
+                        str(width),
+                        str(low_size),
+                        width_prune_ratio,
+                    )
                     return None
 
                 best_fit_path = low_path
