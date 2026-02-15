@@ -364,13 +364,35 @@ def shrink_gif_to_target(
                         "[shrink] early-stop triggered: low improvement streak reached"
                     )
 
-            def _cache_set(cache_key: str, width, fps):
+            def _cache_set(cache_key: str, width, fps, alias_keys=None):
                 try:
-                    cache_data[cache_key] = {
+                    entry = {
                         "width": ("orig" if width is None else int(width)),
                         "fps": int(fps),
                         "ts": int(time.time()),
                     }
+                    cache_data[cache_key] = entry
+                    if alias_keys:
+                        for ak in alias_keys:
+                            if ak:
+                                cache_data[str(ak)] = dict(entry)
+
+                    recent = cache_data.get("__recent_success")
+                    if not isinstance(recent, list):
+                        recent = []
+                    recent.insert(
+                        0,
+                        {
+                            "source": source_tag,
+                            "width_now": int(hi_width),
+                            "target_now": int(target_bytes),
+                            "bucket_now": int(size_bucket_now),
+                            "width": ("orig" if width is None else int(width)),
+                            "fps": int(fps),
+                            "ts": int(time.time()),
+                        },
+                    )
+                    cache_data["__recent_success"] = recent[:20]
                     with open(cache_path, "w", encoding="utf-8") as cf:
                         json.dump(cache_data, cf, ensure_ascii=False)
                 except Exception:
@@ -439,6 +461,36 @@ def shrink_gif_to_target(
                 if best_score is not None and best_score <= 0.40:
                     return best_key, best_entry
                 return None, None
+
+            def _find_recent_cache_entries(
+                src_tag: str, width_now: int, target_now: int, bucket_now: int
+            ):
+                recent = cache_data.get("__recent_success")
+                if not isinstance(recent, list):
+                    return []
+                denom_w = max(1.0, float(width_now))
+                denom_t = max(1.0, float(target_now))
+                denom_b = max(1.0, float(bucket_now if bucket_now > 0 else 1))
+                scored = []
+                for item in recent:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("source") != src_tag:
+                        continue
+                    try:
+                        iw = int(item.get("width_now", width_now))
+                        it = int(item.get("target_now", target_now))
+                        ib = int(item.get("bucket_now", bucket_now))
+                    except Exception:
+                        continue
+                    dw = abs(float(iw - width_now)) / denom_w
+                    dt = abs(float(it - target_now)) / denom_t
+                    db = abs(float(ib - bucket_now)) / denom_b
+                    score = (0.60 * dw) + (0.25 * dt) + (0.15 * db)
+                    if score <= 0.55:
+                        scored.append((score, item))
+                scored.sort(key=lambda x: x[0])
+                return [x[1] for x in scored[:3]]
 
             def _produce(width, fps):
                 key = (width, fps)
@@ -602,9 +654,27 @@ def shrink_gif_to_target(
                 f"{source_tag}_w{hi_width}_t{int(target_bytes)}_b{int(orig_size // (256 * 1024))}"
             )
             size_bucket_now = int(orig_size // (256 * 1024))
+            coarse_width = int((hi_width // 160) * 160)
+            if coarse_width <= 0:
+                coarse_width = hi_width
+            coarse_target = int((int(target_bytes) // (1024 * 1024)) * (1024 * 1024))
+            if coarse_target <= 0:
+                coarse_target = int(target_bytes)
+            coarse_cache_key = (
+                f"{source_tag}_w{coarse_width}_t{coarse_target}_b{size_bucket_now}"
+            )
 
             cached_entry = cache_data.get(cache_key)
             cached_path = _try_cached_entry(cached_entry, cache_key)
+            if not cached_path:
+                coarse_entry = cache_data.get(coarse_cache_key)
+                cached_path = _try_cached_entry(coarse_entry, cache_key)
+                if cached_path:
+                    logging.debug(
+                        "[shrink] cache coarse-hit: key=%s from=%s",
+                        cache_key,
+                        coarse_cache_key,
+                    )
             if not cached_path:
                 near_key, near_entry = _find_neighbor_cache_entry(
                     source_tag, hi_width, int(target_bytes), size_bucket_now
@@ -615,6 +685,14 @@ def shrink_gif_to_target(
                         logging.debug(
                             "[shrink] cache near-hit: key=%s from=%s", cache_key, near_key
                         )
+            if not cached_path:
+                for recent_entry in _find_recent_cache_entries(
+                    source_tag, hi_width, int(target_bytes), size_bucket_now
+                ):
+                    cached_path = _try_cached_entry(recent_entry, cache_key)
+                    if cached_path:
+                        logging.debug("[shrink] cache recent-hit: key=%s", cache_key)
+                        break
             if cached_path:
                 name = os.path.splitext(os.path.basename(gif_path))[0]
                 dst = os.path.join(out_dir, f"{name}_small.gif")
@@ -628,7 +706,7 @@ def shrink_gif_to_target(
                 name = os.path.splitext(os.path.basename(gif_path))[0]
                 dst = os.path.join(out_dir, f"{name}_small.gif")
                 shutil.move(best_orig_path, dst)
-                _cache_set(cache_key, None, best_orig_fps)
+                _cache_set(cache_key, None, best_orig_fps, alias_keys=[coarse_cache_key])
                 return dst
 
             # If even the minimum width cannot satisfy target, fall through to gifsicle.
@@ -651,7 +729,12 @@ def shrink_gif_to_target(
                 name = os.path.splitext(os.path.basename(gif_path))[0]
                 dst = os.path.join(out_dir, f"{name}_small.gif")
                 shutil.move(best_width_path, dst)
-                _cache_set(cache_key, best_width_value, best_width_fps)
+                _cache_set(
+                    cache_key,
+                    best_width_value,
+                    best_width_fps,
+                    alias_keys=[coarse_cache_key],
+                )
                 return dst
 
         base_input = (
