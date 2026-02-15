@@ -163,6 +163,9 @@ def shrink_gif_to_target(
     tmpdir = tempfile.mkdtemp(prefix="shrink_gif_")
     best_candidate: Optional[str] = None
     best_size: Optional[int] = None
+    best_fit_candidate: Optional[str] = None
+    best_fit_size: Optional[int] = None
+    best_fit_rank: Optional[Tuple[int, int, int, int]] = None
 
     def _consider(path: str) -> bool:
         nonlocal best_candidate, best_size
@@ -178,6 +181,26 @@ def shrink_gif_to_target(
             best_candidate = path
             best_size = s
         return False
+
+    def _consider_fit(path: str, rank: Tuple[int, int, int, int]) -> bool:
+        nonlocal best_fit_candidate, best_fit_size, best_fit_rank
+        try:
+            s = os.path.getsize(path)
+        except Exception:
+            return False
+        _consider(path)
+        if s > target_bytes:
+            return False
+        if (
+            best_fit_candidate is None
+            or best_fit_rank is None
+            or rank > best_fit_rank
+            or (rank == best_fit_rank and (best_fit_size is None or s < best_fit_size))
+        ):
+            best_fit_candidate = path
+            best_fit_size = s
+            best_fit_rank = rank
+        return True
 
     try:
         # ffmpeg palette attempts
@@ -198,6 +221,15 @@ def shrink_gif_to_target(
         if ffmpeg_exe:
             min_width = 320
             produced = {}
+            palette_cache = {}
+            try:
+                max_ffmpeg_variants = int(
+                    os.environ.get("SHRINK_MAX_FFMPEG_VARIANTS", "12")
+                )
+            except Exception:
+                max_ffmpeg_variants = 12
+            max_ffmpeg_variants = max(1, max_ffmpeg_variants)
+            ffmpeg_variants_tried = [0]
 
             def _run_palette(width, fps):
                 scale_expr = (
@@ -206,22 +238,26 @@ def shrink_gif_to_target(
                     else "scale=iw:ih:flags=lanczos"
                 )
                 tag = f'{fps}_{width or "orig"}'
-                palette = os.path.join(tmpdir, f"palette_{tag}.png")
+                palette_key = str(width or "orig")
+                palette = palette_cache.get(palette_key)
+                if not palette:
+                    palette = os.path.join(tmpdir, f"palette_{palette_key}.png")
+                    _run_cmd_timed(
+                        [
+                            ffmpeg_exe,
+                            "-y",
+                            "-i",
+                            gif_path,
+                            "-vf",
+                            ("fps=" + str(fps) + "," + scale_expr + ",palettegen"),
+                            palette,
+                        ],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    palette_cache[palette_key] = palette
                 out_gif = os.path.join(tmpdir, f"ff_{tag}.gif")
-                _run_cmd_timed(
-                    [
-                        ffmpeg_exe,
-                        "-y",
-                        "-i",
-                        gif_path,
-                        "-vf",
-                        ("fps=" + str(fps) + "," + scale_expr + ",palettegen"),
-                        palette,
-                    ],
-                    check=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
                 _run_cmd_timed(
                     [
                         ffmpeg_exe,
@@ -255,7 +291,11 @@ def shrink_gif_to_target(
                 key = (width, fps)
                 if key in produced:
                     return produced[key]
+                if ffmpeg_variants_tried[0] >= max_ffmpeg_variants:
+                    produced[key] = None
+                    return None
                 try:
+                    ffmpeg_variants_tried[0] += 1
                     produced[key] = _run_palette(width, fps)
                 except Exception:
                     produced[key] = None
