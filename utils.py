@@ -196,60 +196,149 @@ def shrink_gif_to_target(
                     pass
 
         if ffmpeg_exe:
-            fps_list = [15, 12, 10, 8, 6, 5]
-            width_list = [None, 800, 640, 480, 320]
-            for fps in fps_list:
-                for width in width_list:
-                    palette = os.path.join(
-                        tmpdir, f'palette_{fps}_{width or "orig"}.png'
-                    )
-                    out_gif = os.path.join(tmpdir, f'ff_{fps}_{width or "orig"}.gif')
-                    scale_expr = (
-                        f"scale={width}:-1:flags=lanczos"
-                        if width
-                        else "scale=iw:ih:flags=lanczos"
-                    )
-                    try:
-                        _run_cmd_timed(
-                            [
-                                ffmpeg_exe,
-                                "-y",
-                                "-i",
-                                gif_path,
-                                "-vf",
-                                ("fps=" + str(fps) + "," + scale_expr + ",palettegen"),
-                                palette,
-                            ],
-                            check=True,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                        )
-                        _run_cmd_timed(
-                            [
-                                ffmpeg_exe,
-                                "-y",
-                                "-i",
-                                gif_path,
-                                "-i",
-                                palette,
-                                "-lavfi",
-                                (
-                                    "fps=" + str(fps) + "," + scale_expr + "[x];"
-                                    "[x][1:v]paletteuse=dither=bayer"
-                                ),
-                                out_gif,
-                            ],
-                            check=True,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                        )
-                        if _consider(out_gif):
-                            name = os.path.splitext(os.path.basename(gif_path))[0]
-                            dst = os.path.join(out_dir, f"{name}_small.gif")
-                            shutil.move(out_gif, dst)
-                            return dst
-                    except Exception:
+            min_width = 320
+            produced = {}
+
+            def _run_palette(width, fps):
+                scale_expr = (
+                    f"scale={width}:-1:flags=lanczos"
+                    if width
+                    else "scale=iw:ih:flags=lanczos"
+                )
+                tag = f'{fps}_{width or "orig"}'
+                palette = os.path.join(tmpdir, f"palette_{tag}.png")
+                out_gif = os.path.join(tmpdir, f"ff_{tag}.gif")
+                _run_cmd_timed(
+                    [
+                        ffmpeg_exe,
+                        "-y",
+                        "-i",
+                        gif_path,
+                        "-vf",
+                        ("fps=" + str(fps) + "," + scale_expr + ",palettegen"),
+                        palette,
+                    ],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                _run_cmd_timed(
+                    [
+                        ffmpeg_exe,
+                        "-y",
+                        "-i",
+                        gif_path,
+                        "-i",
+                        palette,
+                        "-lavfi",
+                        (
+                            "fps=" + str(fps) + "," + scale_expr + "[x];"
+                            "[x][1:v]paletteuse=dither=bayer"
+                        ),
+                        out_gif,
+                    ],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return out_gif
+
+            def _fits_target(path):
+                try:
+                    size = os.path.getsize(path)
+                except Exception:
+                    return False
+                _consider(path)
+                return size <= target_bytes
+
+            def _produce(width, fps):
+                key = (width, fps)
+                if key in produced:
+                    return produced[key]
+                try:
+                    produced[key] = _run_palette(width, fps)
+                except Exception:
+                    produced[key] = None
+                return produced[key]
+
+            def _best_fps_path_for_width(width):
+                high_fps = 15
+                low_fps = 5
+
+                high_path = _produce(width, high_fps)
+                if high_path and _fits_target(high_path):
+                    return high_path
+
+                low_path = _produce(width, low_fps)
+                if not (low_path and _fits_target(low_path)):
+                    return None
+
+                best_fit_path = low_path
+                lo = low_fps + 1
+                hi = high_fps - 1
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    mid_path = _produce(width, mid)
+                    if not mid_path:
+                        hi = mid - 1
                         continue
+                    if _fits_target(mid_path):
+                        best_fit_path = mid_path
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+                return best_fit_path
+
+            def _probe_gif_width(path):
+                reader = None
+                try:
+                    import imageio
+
+                    reader = imageio.get_reader(path)
+                    frame = reader.get_next_data()
+                    if getattr(frame, "shape", None) and len(frame.shape) >= 2:
+                        return int(frame.shape[1])
+                except Exception:
+                    return None
+                finally:
+                    try:
+                        if reader is not None:
+                            reader.close()
+                    except Exception:
+                        pass
+                return None
+
+            # First try original width (highest quality) with FPS binary search.
+            best_orig = _best_fps_path_for_width(None)
+            if best_orig:
+                name = os.path.splitext(os.path.basename(gif_path))[0]
+                dst = os.path.join(out_dir, f"{name}_small.gif")
+                shutil.move(best_orig, dst)
+                return dst
+
+            src_width = _probe_gif_width(gif_path)
+            hi_width = int(src_width) if src_width else 800
+            min_width_effective = min_width if hi_width >= min_width else hi_width
+
+            # If even the minimum width cannot satisfy target, fall through to gifsicle.
+            low_fit = _best_fps_path_for_width(min_width_effective)
+            if low_fit:
+                best_width_path = low_fit
+                lo = min_width_effective + 1
+                hi = hi_width
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    mid_fit = _best_fps_path_for_width(mid)
+                    if mid_fit:
+                        best_width_path = mid_fit
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+
+                name = os.path.splitext(os.path.basename(gif_path))[0]
+                dst = os.path.join(out_dir, f"{name}_small.gif")
+                shutil.move(best_width_path, dst)
+                return dst
 
         base_input = (
             best_candidate
