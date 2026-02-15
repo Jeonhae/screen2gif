@@ -484,11 +484,60 @@ def shrink_gif_to_target(
             else gif_path
         )
 
+        try:
+            max_gifsicle_variants = int(
+                os.environ.get("SHRINK_MAX_GIFSICLE_VARIANTS", "12")
+            )
+        except Exception:
+            max_gifsicle_variants = 12
+        max_gifsicle_variants = max(1, max_gifsicle_variants)
+        gifsicle_variants_tried = 0
+        try:
+            gifsicle_early_stop_min_improve = float(
+                os.environ.get("SHRINK_GIFSICLE_EARLY_STOP_MIN_IMPROVE", "0.02")
+            )
+        except Exception:
+            gifsicle_early_stop_min_improve = 0.02
+        try:
+            gifsicle_early_stop_streak_limit = int(
+                os.environ.get("SHRINK_GIFSICLE_EARLY_STOP_STREAK", "2")
+            )
+        except Exception:
+            gifsicle_early_stop_streak_limit = 2
+        gifsicle_early_stop_min_improve = max(0.0, gifsicle_early_stop_min_improve)
+        gifsicle_early_stop_streak_limit = max(1, gifsicle_early_stop_streak_limit)
+        gifsicle_last_oversize = None
+        gifsicle_low_improve_streak = 0
+        gifsicle_early_stop = False
+
+        def _update_gifsicle_early_stop(size: Optional[int]) -> None:
+            nonlocal gifsicle_last_oversize, gifsicle_low_improve_streak, gifsicle_early_stop
+            if size is None or size <= target_bytes:
+                return
+            prev = gifsicle_last_oversize
+            if prev is not None and prev > 0 and size < prev:
+                improve = float(prev - size) / float(prev)
+                if improve < gifsicle_early_stop_min_improve:
+                    gifsicle_low_improve_streak += 1
+                else:
+                    gifsicle_low_improve_streak = 0
+            else:
+                gifsicle_low_improve_streak = 0
+            gifsicle_last_oversize = size
+            if gifsicle_low_improve_streak >= gifsicle_early_stop_streak_limit:
+                gifsicle_early_stop = True
+                logging.debug(
+                    "[shrink] gifsicle early-stop triggered: low improvement streak reached"
+                )
+
         # gifsicle color reductions
         if gifsicle_exe:
             for colors in (256, 128, 64, 32, 16, 8):
+                if gifsicle_early_stop or gifsicle_variants_tried >= max_gifsicle_variants:
+                    break
                 out_gif = os.path.join(tmpdir, f"g_colors_{colors}.gif")
                 try:
+                    gifsicle_variants_tried += 1
                     _run_cmd_timed(
                         [
                             gifsicle_exe,
@@ -508,14 +557,21 @@ def shrink_gif_to_target(
                         dst = os.path.join(out_dir, f"{name}_small.gif")
                         shutil.move(out_gif, dst)
                         return dst
+                    try:
+                        _update_gifsicle_early_stop(os.path.getsize(out_gif))
+                    except Exception:
+                        pass
                 except Exception:
                     continue
 
         # gifsicle lossy fallback
         if gifsicle_exe:
             for lossy in (40, 80, 120, 160, 200, 300, 400):
+                if gifsicle_early_stop or gifsicle_variants_tried >= max_gifsicle_variants:
+                    break
                 out_gif = os.path.join(tmpdir, f"g_lossy_{lossy}.gif")
                 try:
+                    gifsicle_variants_tried += 1
                     _run_cmd_timed(
                         [
                             gifsicle_exe,
@@ -534,6 +590,10 @@ def shrink_gif_to_target(
                         dst = os.path.join(out_dir, f"{name}_small.gif")
                         shutil.move(out_gif, dst)
                         return dst
+                    try:
+                        _update_gifsicle_early_stop(os.path.getsize(out_gif))
+                    except Exception:
+                        pass
                 except Exception:
                     continue
 
