@@ -345,11 +345,13 @@ def shrink_gif_to_target(
                 os.path.dirname(__file__), "logs", "shrink_param_cache.json"
             )
             cache_data = {}
+            cache_io_lock = threading.Lock()
             try:
-                with open(cache_path, "r", encoding="utf-8") as cf:
-                    obj = json.load(cf)
-                    if isinstance(obj, dict):
-                        cache_data = obj
+                with cache_io_lock:
+                    with open(cache_path, "r", encoding="utf-8") as cf:
+                        obj = json.load(cf)
+                        if isinstance(obj, dict):
+                            cache_data = obj
             except Exception:
                 cache_data = {}
             try:
@@ -437,12 +439,16 @@ def shrink_gif_to_target(
                         "[shrink] early-stop triggered: low improvement streak reached"
                     )
 
-            def _persist_cache():
+            def _persist_cache_locked():
                 try:
                     with open(cache_path, "w", encoding="utf-8") as cf:
                         json.dump(cache_data, cf, ensure_ascii=False)
                 except Exception:
                     pass
+
+            def _persist_cache():
+                with cache_io_lock:
+                    _persist_cache_locked()
 
             def _blacklist_key(width, fps):
                 return f"{'orig' if width is None else int(width)}:{int(fps)}"
@@ -466,67 +472,71 @@ def shrink_gif_to_target(
 
             def _blacklist_is_active(width, fps) -> bool:
                 now_ts = int(time.time())
-                _blacklist_prune(now_ts)
-                bm = cache_data.get("__ffmpeg_blacklist")
-                if not isinstance(bm, dict):
-                    return False
-                ts = bm.get(_blacklist_key(width, fps))
-                if ts is None:
-                    return False
-                try:
-                    return now_ts - int(ts) < blacklist_ttl_sec
-                except Exception:
-                    return False
+                with cache_io_lock:
+                    _blacklist_prune(now_ts)
+                    bm = cache_data.get("__ffmpeg_blacklist")
+                    if not isinstance(bm, dict):
+                        return False
+                    ts = bm.get(_blacklist_key(width, fps))
+                    if ts is None:
+                        return False
+                    try:
+                        return now_ts - int(ts) < blacklist_ttl_sec
+                    except Exception:
+                        return False
 
             def _blacklist_mark_failure(width, fps):
                 now_ts = int(time.time())
-                _blacklist_prune(now_ts)
-                bm = cache_data.get("__ffmpeg_blacklist")
-                if not isinstance(bm, dict):
-                    bm = {}
-                    cache_data["__ffmpeg_blacklist"] = bm
-                bm[_blacklist_key(width, fps)] = now_ts
-                _persist_cache()
+                with cache_io_lock:
+                    _blacklist_prune(now_ts)
+                    bm = cache_data.get("__ffmpeg_blacklist")
+                    if not isinstance(bm, dict):
+                        bm = {}
+                        cache_data["__ffmpeg_blacklist"] = bm
+                    bm[_blacklist_key(width, fps)] = now_ts
+                    _persist_cache_locked()
 
             def _blacklist_mark_success(width, fps):
-                bm = cache_data.get("__ffmpeg_blacklist")
-                if isinstance(bm, dict):
-                    bm.pop(_blacklist_key(width, fps), None)
-                _persist_cache()
-
-            def _cache_set(cache_key: str, width, fps, alias_keys=None):
-                try:
-                    entry = {
-                        "width": ("orig" if width is None else int(width)),
-                        "fps": int(fps),
-                        "ts": int(time.time()),
-                    }
-                    cache_data[cache_key] = entry
-                    if alias_keys:
-                        for ak in alias_keys:
-                            if ak:
-                                cache_data[str(ak)] = dict(entry)
-
-                    recent = cache_data.get("__recent_success")
-                    if not isinstance(recent, list):
-                        recent = []
-                    recent.insert(
-                        0,
-                        {
-                            "source": source_tag,
-                            "width_now": int(hi_width),
-                            "target_now": int(target_bytes),
-                            "bucket_now": int(size_bucket_now),
-                            "width": ("orig" if width is None else int(width)),
-                            "fps": int(fps),
-                            "ts": int(time.time()),
-                        },
-                    )
-                    cache_data["__recent_success"] = recent[:20]
+                with cache_io_lock:
                     bm = cache_data.get("__ffmpeg_blacklist")
                     if isinstance(bm, dict):
                         bm.pop(_blacklist_key(width, fps), None)
-                    _persist_cache()
+                    _persist_cache_locked()
+
+            def _cache_set(cache_key: str, width, fps, alias_keys=None):
+                try:
+                    with cache_io_lock:
+                        entry = {
+                            "width": ("orig" if width is None else int(width)),
+                            "fps": int(fps),
+                            "ts": int(time.time()),
+                        }
+                        cache_data[cache_key] = entry
+                        if alias_keys:
+                            for ak in alias_keys:
+                                if ak:
+                                    cache_data[str(ak)] = dict(entry)
+
+                        recent = cache_data.get("__recent_success")
+                        if not isinstance(recent, list):
+                            recent = []
+                        recent.insert(
+                            0,
+                            {
+                                "source": source_tag,
+                                "width_now": int(hi_width),
+                                "target_now": int(target_bytes),
+                                "bucket_now": int(size_bucket_now),
+                                "width": ("orig" if width is None else int(width)),
+                                "fps": int(fps),
+                                "ts": int(time.time()),
+                            },
+                        )
+                        cache_data["__recent_success"] = recent[:20]
+                        bm = cache_data.get("__ffmpeg_blacklist")
+                        if isinstance(bm, dict):
+                            bm.pop(_blacklist_key(width, fps), None)
+                        _persist_cache_locked()
                 except Exception:
                     pass
 
@@ -572,7 +582,9 @@ def shrink_gif_to_target(
                 denom_w = max(1.0, float(width_now))
                 denom_t = max(1.0, float(target_now))
                 denom_b = max(1.0, float(bucket_now if bucket_now > 0 else 1))
-                for k, entry in cache_data.items():
+                with cache_io_lock:
+                    cache_items = list(cache_data.items())
+                for k, entry in cache_items:
                     meta = _parse_cache_key_meta(k)
                     if not meta:
                         continue
@@ -597,7 +609,9 @@ def shrink_gif_to_target(
             def _find_recent_cache_entries(
                 src_tag: str, width_now: int, target_now: int, bucket_now: int
             ):
-                recent = cache_data.get("__recent_success")
+                with cache_io_lock:
+                    recent_obj = cache_data.get("__recent_success")
+                    recent = list(recent_obj) if isinstance(recent_obj, list) else []
                 if not isinstance(recent, list):
                     return []
                 denom_w = max(1.0, float(width_now))
@@ -832,12 +846,14 @@ def shrink_gif_to_target(
                 f"{source_tag}_w{coarse_width}_t{coarse_target}_b{size_bucket_now}"
             )
 
-            cached_entry = cache_data.get(cache_key)
+            with cache_io_lock:
+                cached_entry = cache_data.get(cache_key)
             cached_path = _try_cached_entry(cached_entry, cache_key)
             if cached_path:
                 metrics["cache_hit"] = "exact"
             if not cached_path:
-                coarse_entry = cache_data.get(coarse_cache_key)
+                with cache_io_lock:
+                    coarse_entry = cache_data.get(coarse_cache_key)
                 cached_path = _try_cached_entry(coarse_entry, cache_key)
                 if cached_path:
                     metrics["cache_hit"] = "coarse"

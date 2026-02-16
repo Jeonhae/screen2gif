@@ -565,6 +565,19 @@ def stop_recording_flow(ctx):
         )
         return
 
+    if not recorder.is_recording():
+        show_topmost_message(
+            None,
+            "Not recording",
+            "No active recording to stop. Please click Start first.",
+            icon=QtWidgets.QMessageBox.Information,
+        )
+        try:
+            ctx.return_to_main()
+        except Exception:
+            logging.exception("return_to_main failed when stop clicked while idle")
+        return
+
     mp4_path, stopped_ok = recorder.stop(timeout=5.0)
     try:
         visibility_monitor.stop()
@@ -701,6 +714,22 @@ def main():
 
     def on_stop():
         try:
+            # Protect against invoking stop/conversion when not actively recording.
+            try:
+                if not (_ctx.recorder and _ctx.recorder.is_recording()):
+                    try:
+                        show_topmost_message(
+                            None,
+                            "Not recording",
+                            "No active recording to stop. Please click Start first.",
+                            icon=QtWidgets.QMessageBox.Information,
+                        )
+                    except Exception:
+                        logging.exception("show_topmost_message failed in on_stop")
+                    return
+            except Exception:
+                logging.exception("Failed checking recorder state in on_stop")
+
             stop_recording_flow(_ctx)
         except Exception:
             logging.exception("stop_recording_flow raised in on_stop")
@@ -974,11 +1003,17 @@ def main():
         except Exception:
             logging.exception("Failed to validate selection state on stop")
 
-        # Fallback: call on_stop to ensure consistent behavior
+        # Fallback: explicitly avoid stop flow when idle.
+        # This prevents reusing stale recorder output paths from older runs.
         try:
-            on_stop()
+            show_topmost_message(
+                overlay,
+                "提示",
+                "当前未在录制，请先按Start按钮开始录制",
+                buttons=QtWidgets.QMessageBox.Ok,
+            )
         except Exception:
-            logging.exception("Fallback stop handler failed")
+            logging.exception("Fallback idle stop hint failed")
 
     toolbar.stop_requested.connect(on_stop_clicked)
 
