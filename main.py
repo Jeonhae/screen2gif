@@ -589,6 +589,17 @@ def stop_recording_flow(ctx):
     except Exception:
         logging.exception("overlay.stop_recording failed in stop_recording_flow")
     try:
+        # Save current selection so next round can reuse it (same process only)
+        try:
+            sel = getattr(overlay, "selection_rect", None)
+            if sel is not None and (not getattr(sel, "isNull", lambda: False)()):
+                try:
+                    ctx.last_selection_rect = sel
+                except Exception:
+                    logging.exception("Failed saving last selection rect in stop_recording_flow")
+        except Exception:
+            logging.exception("Failed to capture selection before hiding UI in stop_recording_flow")
+
         overlay.hide()
         toolbar.hide()
     except Exception:
@@ -772,6 +783,9 @@ def main():
                 super().closeEvent(event)
 
     initial = InitialWindow()
+    # Remember the last selection rectangle during this app session.
+    # Stored as global coords tuple: (x, y, w, h).
+    _last_selection_rect_global = [None]
 
     def _return_to_main():
         # Stop any active recording/countdown
@@ -798,6 +812,19 @@ def main():
         # Reset UI
         try:
             overlay.stop_recording()
+            try:
+                sel = getattr(overlay, "selection_rect", None)
+                if sel and not sel.isNull():
+                    r = sel.normalized()
+                    tl = overlay.mapToGlobal(r.topLeft())
+                    _last_selection_rect_global[0] = (
+                        int(tl.x()),
+                        int(tl.y()),
+                        int(r.width()),
+                        int(r.height()),
+                    )
+            except Exception:
+                logging.exception("Failed to persist last selection rectangle")
             overlay.hide()
             toolbar.hide()
             toolbar.start_btn.setEnabled(True)
@@ -823,6 +850,8 @@ def main():
     _ctx.conversion_in_progress = False
     _ctx.conversion_worker = None
     _ctx.conversion_thread = None
+    # Store last used selection rect between rounds within same process
+    _ctx.last_selection_rect = None
     _ctx.dispatcher = MainThreadDispatcher()
     _ctx.dispatcher.conversion_result.connect(
         lambda result: _finalize_conversion_result(_ctx, result)
@@ -1084,13 +1113,31 @@ def main():
         try:
             try:
                 screen_geom = QtWidgets.QApplication.primaryScreen().availableGeometry()
-                cw, ch = 400, 300
-                cx = screen_geom.x() + (screen_geom.width() - cw) // 2
-                cy = screen_geom.y() + (screen_geom.height() - ch) // 2
-                top_left = overlay.mapFromGlobal(QtCore.QPoint(cx, cy))
-                overlay.selection_rect = QtCore.QRect(
-                    top_left.x(), top_left.y(), cw, ch
-                )
+                restored = False
+                last_rect = _last_selection_rect_global[0]
+                if last_rect:
+                    try:
+                        gx, gy, gw, gh = last_rect
+                        if gw > 0 and gh > 0:
+                            top_left = overlay.mapFromGlobal(QtCore.QPoint(gx, gy))
+                            overlay.selection_rect = QtCore.QRect(
+                                int(top_left.x()),
+                                int(top_left.y()),
+                                int(gw),
+                                int(gh),
+                            )
+                            restored = True
+                    except Exception:
+                        logging.exception("Failed to restore last selection rectangle")
+                        restored = False
+                if not restored:
+                    cw, ch = 400, 300
+                    cx = screen_geom.x() + (screen_geom.width() - cw) // 2
+                    cy = screen_geom.y() + (screen_geom.height() - ch) // 2
+                    top_left = overlay.mapFromGlobal(QtCore.QPoint(cx, cy))
+                    overlay.selection_rect = QtCore.QRect(
+                        top_left.x(), top_left.y(), cw, ch
+                    )
                 try:
                     overlay.update_control_handles()
                 except Exception:
