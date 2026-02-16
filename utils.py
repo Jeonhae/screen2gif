@@ -196,6 +196,8 @@ def shrink_gif_to_target(
         "status": "unknown",
         "result_path": "",
         "result_size": None,
+        "time_budget_ms": None,
+        "time_budget_hit": False,
     }
 
     def _emit_metrics(status: str, result_path: Optional[str] = None):
@@ -277,6 +279,25 @@ def shrink_gif_to_target(
     best_fit_candidate: Optional[str] = None
     best_fit_size: Optional[int] = None
     best_fit_rank: Optional[Tuple[int, int, int, int]] = None
+    try:
+        time_budget_ms = int(os.environ.get("SHRINK_TIME_BUDGET_MS", "12000"))
+    except Exception:
+        time_budget_ms = 12000
+    time_budget_ms = max(0, time_budget_ms)
+    metrics["time_budget_ms"] = int(time_budget_ms)
+    budget_deadline = (
+        time.perf_counter() + (time_budget_ms / 1000.0)
+        if time_budget_ms > 0
+        else None
+    )
+
+    def _time_budget_exceeded() -> bool:
+        if budget_deadline is None:
+            return False
+        if time.perf_counter() >= budget_deadline:
+            metrics["time_budget_hit"] = True
+            return True
+        return False
 
     def _consider(path: str) -> bool:
         nonlocal best_candidate, best_size
@@ -318,6 +339,8 @@ def shrink_gif_to_target(
         def _run_cmd_timed(cmd, **kwargs):
             t0 = time.perf_counter()
             try:
+                if _time_budget_exceeded():
+                    raise TimeoutError("shrink time budget exceeded")
                 run_hidden(cmd, **kwargs)
             finally:
                 t1 = time.perf_counter()
@@ -397,6 +420,35 @@ def shrink_gif_to_target(
                 blacklist_ttl_sec = 900
             blacklist_ttl_sec = max(60, blacklist_ttl_sec)
 
+            # Overall time budget for this shrink run (milliseconds).
+            # If exceeded, operations should abort early to respect latency.
+            try:
+                time_budget_ms = int(os.environ.get("SHRINK_TIME_BUDGET_MS", "15000"))
+            except Exception:
+                time_budget_ms = 15000
+            time_budget_ms = max(1000, time_budget_ms)
+            metrics["time_budget_ms"] = int(time_budget_ms)
+
+            # Adjustable neighbor cache score threshold (higher -> more aggressive hits)
+            try:
+                neighbor_score_threshold = float(
+                    os.environ.get("SHRINK_NEIGHBOR_SCORE_THRESHOLD", "0.4")
+                )
+            except Exception:
+                neighbor_score_threshold = 0.4
+            neighbor_score_threshold = max(0.0, min(1.0, float(neighbor_score_threshold)))
+            metrics["neighbor_score_threshold"] = neighbor_score_threshold
+
+            def _time_exceeded():
+                try:
+                    elapsed_ms = (time.perf_counter() - run_started) * 1000.0
+                    if elapsed_ms > float(time_budget_ms):
+                        metrics["time_budget_exceeded"] = True
+                        return True
+                except Exception:
+                    pass
+                return False
+
             def _run_palette(width, fps):
                 scale_expr = (
                     f"scale={width}:-1:flags=lanczos"
@@ -436,7 +488,7 @@ def shrink_gif_to_target(
                         "-lavfi",
                         (
                             "fps=" + str(fps) + "," + scale_expr + "[x];"
-                            "[x][1:v]paletteuse=dither=bayer"
+                            "[x][1:v]paletteuse=dither=floyd_steinberg"
                         ),
                         out_gif,
                     ],
@@ -709,8 +761,13 @@ def shrink_gif_to_target(
                         best_entry = entry
                 if best_entry is None:
                     return None, None
-                # Keep neighbor match reasonably close.
-                if best_score is not None and best_score <= 0.40:
+                # Keep neighbor match reasonably close. Threshold is configurable
+                # to allow more aggressive cache hits when desired.
+                try:
+                    thresh = float(neighbor_score_threshold)
+                except Exception:
+                    thresh = 0.4
+                if best_score is not None and best_score <= thresh:
                     return best_key, best_entry
                 return None, None
 
@@ -768,6 +825,39 @@ def shrink_gif_to_target(
                     return 10
                 return max(5, min(15, int(best_fps)))
 
+            def _try_param_candidates(
+                candidates,
+                cache_hit_label: str,
+                cache_key_for_write: str,
+                alias_keys=None,
+            ):
+                seen = set()
+                for width, fps in candidates:
+                    if _time_budget_exceeded():
+                        break
+                    try:
+                        norm_width = None if width in (None, "orig") else int(width)
+                        norm_fps = max(5, min(15, int(fps)))
+                    except Exception:
+                        continue
+                    key = (norm_width, norm_fps)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    p = _produce(norm_width, norm_fps)
+                    if not p:
+                        continue
+                    if _fits_target(p):
+                        _cache_set(
+                            cache_key_for_write,
+                            norm_width,
+                            norm_fps,
+                            alias_keys=alias_keys,
+                        )
+                        metrics["cache_hit"] = cache_hit_label
+                        return p
+                return None
+
             def _produce(width, fps):
                 key = (width, fps)
                 while True:
@@ -780,6 +870,9 @@ def shrink_gif_to_target(
                                 return val
                             wait_event = produced_events.get(key)
                         else:
+                            if _time_budget_exceeded():
+                                produced[key] = None
+                                return None
                             if early_stop_triggered[0] or (
                                 ffmpeg_variants_tried[0] >= max_ffmpeg_variants
                             ):
@@ -839,6 +932,8 @@ def shrink_gif_to_target(
                 results = {}
                 if ffmpeg_parallel_workers <= 1 or len(uniq) <= 1:
                     for fps in uniq:
+                        if _time_budget_exceeded():
+                            break
                         results[fps] = _produce(width, fps)
                     return results
                 with ThreadPoolExecutor(
@@ -854,6 +949,8 @@ def shrink_gif_to_target(
                 return results
 
             def _best_fps_path_for_width(width):
+                if _time_budget_exceeded():
+                    return None
                 high_fps = 15
                 low_fps = 5
                 w_now = hi_width if width is None else int(width)
@@ -903,6 +1000,8 @@ def shrink_gif_to_target(
                     hi = high_fps - 1
                 lo = best_fit_fps + 1
                 while lo <= hi:
+                    if _time_budget_exceeded():
+                        break
                     mid = (lo + hi) // 2
                     mid_path = _produce(width, mid)
                     if not mid_path:
@@ -954,6 +1053,44 @@ def shrink_gif_to_target(
                 f"{source_tag}_w{coarse_width}_t{coarse_target}_b{size_bucket_now}"
             )
 
+            # Aggressive cache probing:
+            # try recent successful params first (plus tiny fps tweaks),
+            # then fall back to exact/coarse/neighbor key matches.
+            try:
+                recent_probe_limit = int(
+                    os.environ.get("SHRINK_RECENT_PROBE_LIMIT", "8")
+                )
+            except Exception:
+                recent_probe_limit = 8
+            recent_probe_limit = max(2, min(20, recent_probe_limit))
+            recent_candidates = []
+            for recent_entry in _find_recent_cache_entries(
+                source_tag, hi_width, int(target_bytes), size_bucket_now
+            ):
+                try:
+                    rw = recent_entry.get("width")
+                    rfps = int(recent_entry.get("fps", 10))
+                except Exception:
+                    continue
+                recent_candidates.append((rw, rfps))
+                recent_candidates.append((rw, rfps + 1))
+                recent_candidates.append((rw, rfps - 1))
+                if len(recent_candidates) >= recent_probe_limit:
+                    break
+            if recent_candidates:
+                cached_path = _try_param_candidates(
+                    recent_candidates[:recent_probe_limit],
+                    "recent_probe",
+                    cache_key,
+                    alias_keys=[coarse_cache_key],
+                )
+                if cached_path:
+                    name = os.path.splitext(os.path.basename(gif_path))[0]
+                    dst = os.path.join(out_dir, f"{name}_small.gif")
+                    shutil.move(cached_path, dst)
+                    _emit_metrics("ok_cache", dst)
+                    return dst
+
             with cache_io_lock:
                 cached_entry = cache_data.get(cache_key)
             cached_path = _try_cached_entry(cached_entry, cache_key)
@@ -987,6 +1124,8 @@ def shrink_gif_to_target(
                 for recent_entry in _find_recent_cache_entries(
                     source_tag, hi_width, int(target_bytes), size_bucket_now
                 ):
+                    if _time_budget_exceeded():
+                        break
                     cached_path = _try_cached_entry(recent_entry, cache_key)
                     if cached_path:
                         metrics["cache_hit"] = "recent"
@@ -1027,6 +1166,8 @@ def shrink_gif_to_target(
                 lo = min_width_effective + 1
                 hi = hi_width
                 while lo <= hi:
+                    if _time_budget_exceeded():
+                        break
                     mid = (lo + hi) // 2
                     if _width_fits_at_low_fps(mid):
                         best_width = mid
@@ -1111,6 +1252,8 @@ def shrink_gif_to_target(
         if gifsicle_exe:
             for colors in (256, 128, 64, 32, 16, 8):
                 if (
+                    _time_budget_exceeded()
+                    or
                     gifsicle_early_stop
                     or gifsicle_variants_tried >= max_gifsicle_variants
                 ):
@@ -1146,10 +1289,17 @@ def shrink_gif_to_target(
                 except Exception:
                     continue
 
-        # gifsicle lossy fallback
-        if gifsicle_exe:
+        # gifsicle lossy fallback (disabled by default to preserve quality).
+        # Enable only when needed via SHRINK_ENABLE_GIFSICLE_LOSSY=1.
+        enable_gifsicle_lossy = (
+            str(os.environ.get("SHRINK_ENABLE_GIFSICLE_LOSSY", "0")).strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        if gifsicle_exe and enable_gifsicle_lossy:
             for lossy in (40, 80, 120, 160, 200, 300, 400):
                 if (
+                    _time_budget_exceeded()
+                    or
                     gifsicle_early_stop
                     or gifsicle_variants_tried >= max_gifsicle_variants
                 ):
