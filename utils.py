@@ -14,6 +14,48 @@ import logging
 # Do not use imageio_ffmpeg fallback - prefer repo/bin/ffmpeg or system ffmpeg.
 
 
+def get_subprocess_no_window_kwargs() -> dict:
+    """Return subprocess kwargs to suppress console windows on Windows."""
+    # This is used for external tool invocations (ffmpeg, gifsicle)
+    # to ensure they run silently without popping up console windows
+    # on Windows. Callers should merge these kwargs into their
+    # subprocess.run invocations or use `run_hidden()`.
+    if os.name != "nt":
+        return {}
+
+    kwargs = {}
+    try:
+        kwargs["creationflags"] = int(subprocess.CREATE_NO_WINDOW)
+    except Exception:
+        pass
+
+    try:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+        kwargs["startupinfo"] = startupinfo
+    except Exception:
+        pass
+
+    return kwargs
+
+
+def run_hidden(cmd, **kwargs):
+    """Run subprocess with hidden-window flags on Windows."""
+    merged = dict(kwargs)
+    hidden = get_subprocess_no_window_kwargs()
+
+    hidden_creationflags = hidden.get("creationflags")
+    if hidden_creationflags is not None:
+        existing = int(merged.get("creationflags", 0))
+        merged["creationflags"] = existing | int(hidden_creationflags)
+
+    if "startupinfo" in hidden and "startupinfo" not in merged:
+        merged["startupinfo"] = hidden["startupinfo"]
+
+    return subprocess.run(cmd, **merged)
+
+
 def ensure_dirs(base_dir=None):
     base = base_dir or os.path.dirname(__file__)
     for d in ("video", "gif", "logs"):
@@ -276,7 +318,7 @@ def shrink_gif_to_target(
         def _run_cmd_timed(cmd, **kwargs):
             t0 = time.perf_counter()
             try:
-                subprocess.run(cmd, **kwargs)
+                run_hidden(cmd, **kwargs)
             finally:
                 t1 = time.perf_counter()
                 try:
