@@ -65,12 +65,9 @@ python screen2gif.py --help
 
 ## Development
 
-- Run tests: `python -m pytest`
+- Run tests: Execute test scripts in `tests/` directory, e.g., `python test_import.py`
 - Build: See scripts in `pkg/` directory
-
-## License
-
-[Specify license, e.g., MIT]
+- Code style: Uses flake8 (see `.flake8`)
 
 ## Contributing
 
