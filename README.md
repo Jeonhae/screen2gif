@@ -1,27 +1,77 @@
-# screenshot2gif
+# screen2gif
 
 A small utility to capture screen frames and save them as an animated GIF.
 
-Requirements
+## Features
+
+- Capture screen recordings and convert to GIF
+- Support for various output formats
+- Cross-platform (Windows, macOS, Linux)
+- Uses Git LFS for large files (e.g., ffmpeg.exe, sample GIFs)
+
+## Requirements
+
 - Python 3.8+
-- See `requirements.txt`
+- Dependencies listed in `requirements.txt`:
+  - Pillow
+  - imageio
+  - imageio-ffmpeg
+  - pyautogui
+  - numpy
+  - PyQt5
+  - mss
+  - opencv-python
+  - pyperclip
 
-Quickstart
+## Installation
 
-1. Create a virtual environment and install dependencies:
+1. Clone the repository:
+
+```bash
+git clone https://github.com/Jeonhae/screen2gif.git
+cd screen2gif
+```
+
+2. Create a virtual environment and install dependencies:
 
 ```bash
 python -m venv .venv
+# On Windows:
 .\.venv\Scripts\activate
-python -m pip install -r requirements.txt
+# On macOS/Linux:
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-2. Run the example capture:
+## Usage
+
+Run the main script to capture and convert:
 
 ```bash
 python screen2gif.py --duration 5 --fps 2 --output out.gif
 ```
 
-Notes
-- On Windows you may need to grant screen-capture permissions.
-- `pyautogui` may require additional OS-level dependencies; consult its docs if screenshots fail.
+For more options, see:
+
+```bash
+python screen2gif.py --help
+```
+
+## Notes
+
+- On Windows, you may need to grant screen-capture permissions.
+- `pyautogui` may require additional OS-level dependencies; consult its documentation if screenshots fail.
+- Large files (e.g., ffmpeg.exe, sample GIFs) are stored using Git LFS. Ensure Git LFS is installed to clone/pull these files.
+
+## Development
+
+- Run tests: `python -m pytest`
+- Build: See scripts in `pkg/` directory
+
+## License
+
+[Specify license, e.g., MIT]
+
+## Contributing
+
+Contributions are welcome! Please open an issue or submit a pull request.
