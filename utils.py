@@ -344,16 +344,9 @@ def shrink_gif_to_target(
             cache_path = os.path.join(
                 os.path.dirname(__file__), "logs", "shrink_param_cache.json"
             )
+            cache_lock_path = cache_path + ".lock"
             cache_data = {}
             cache_io_lock = threading.Lock()
-            try:
-                with cache_io_lock:
-                    with open(cache_path, "r", encoding="utf-8") as cf:
-                        obj = json.load(cf)
-                        if isinstance(obj, dict):
-                            cache_data = obj
-            except Exception:
-                cache_data = {}
             try:
                 blacklist_ttl_sec = int(
                     os.environ.get("SHRINK_BLACKLIST_TTL_SEC", "900")
@@ -439,12 +432,85 @@ def shrink_gif_to_target(
                         "[shrink] early-stop triggered: low improvement streak reached"
                     )
 
-            def _persist_cache_locked():
+            def _acquire_cache_file_lock(timeout_sec: float = 2.0):
+                deadline = time.perf_counter() + max(0.1, timeout_sec)
+                while True:
+                    try:
+                        fd = os.open(
+                            cache_lock_path,
+                            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                        )
+                        try:
+                            os.write(fd, str(os.getpid()).encode("ascii", "ignore"))
+                        except Exception:
+                            pass
+                        return fd
+                    except FileExistsError:
+                        if time.perf_counter() >= deadline:
+                            return None
+                        time.sleep(0.05)
+                    except Exception:
+                        return None
+
+            def _release_cache_file_lock(fd) -> None:
                 try:
-                    with open(cache_path, "w", encoding="utf-8") as cf:
-                        json.dump(cache_data, cf, ensure_ascii=False)
+                    os.close(fd)
                 except Exception:
                     pass
+                try:
+                    if os.path.exists(cache_lock_path):
+                        os.remove(cache_lock_path)
+                except Exception:
+                    pass
+
+            # Attempt an initial, lock-protected read of the cache to avoid
+            # races with concurrent writers from other processes. If acquiring
+            # the file lock fails, fall back to a best-effort read without
+            # the lock.
+            try:
+                lock_fd = _acquire_cache_file_lock(timeout_sec=0.5)
+                if lock_fd is not None:
+                    try:
+                        with open(cache_path, "r", encoding="utf-8") as cf:
+                            obj = json.load(cf)
+                            if isinstance(obj, dict):
+                                cache_data = obj
+                    except Exception:
+                        cache_data = {}
+                    finally:
+                        _release_cache_file_lock(lock_fd)
+                else:
+                    try:
+                        with open(cache_path, "r", encoding="utf-8") as cf:
+                            obj = json.load(cf)
+                            if isinstance(obj, dict):
+                                cache_data = obj
+                    except Exception:
+                        cache_data = {}
+            except Exception:
+                cache_data = {}
+
+            def _persist_cache_locked():
+                lock_fd = _acquire_cache_file_lock()
+                if lock_fd is None:
+                    return
+                tmp_path = (
+                    f"{cache_path}.tmp.{os.getpid()}."
+                    f"{threading.get_ident()}.{int(time.time() * 1000)}"
+                )
+                try:
+                    with open(tmp_path, "w", encoding="utf-8") as cf:
+                        json.dump(cache_data, cf, ensure_ascii=False)
+                    os.replace(tmp_path, cache_path)
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                    except Exception:
+                        pass
+                    _release_cache_file_lock(lock_fd)
 
             def _persist_cache():
                 with cache_io_lock:

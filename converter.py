@@ -15,6 +15,7 @@ def convert_mp4_to_gif(mp4_path: str, gif_path: str, fps: int = 10) -> bool:
     """
     # Use ffmpeg when available for quality
     ffmpeg_exe = resolve_ffmpeg_exe()
+    ffmpeg_failed = False
     if ffmpeg_exe:
         ffmpeg_cmd = ffmpeg_exe
         tmp_root = os.path.join(os.path.dirname(__file__), "tmp_ffmpeg")
@@ -60,27 +61,29 @@ def convert_mp4_to_gif(mp4_path: str, gif_path: str, fps: int = 10) -> bool:
                     gen_res.returncode,
                     (gen_res.stderr or "").strip()[-1000:],
                 )
-                return False
-
-            gif_res = subprocess.run(
-                gif_cmd,
-                capture_output=True,
-                text=True,
-            )
-            if gif_res.returncode != 0:
-                logging.error(
-                    "ffmpeg gif conversion failed (code=%s): %s",
-                    gif_res.returncode,
-                    (gif_res.stderr or "").strip()[-1000:],
+                ffmpeg_failed = True
+            else:
+                gif_res = subprocess.run(
+                    gif_cmd,
+                    capture_output=True,
+                    text=True,
                 )
-                return False
-            return True
+                if gif_res.returncode != 0:
+                    logging.error(
+                        "ffmpeg gif conversion failed (code=%s): %s",
+                        gif_res.returncode,
+                        (gif_res.stderr or "").strip()[-1000:],
+                    )
+                    ffmpeg_failed = True
+                else:
+                    return True
+
         except OSError:
             logging.exception("Failed to execute ffmpeg")
-            return False
+            ffmpeg_failed = True
         except Exception:
             logging.exception("Unexpected ffmpeg conversion error")
-            return False
+            ffmpeg_failed = True
         finally:
             for _ in range(3):
                 try:
@@ -93,6 +96,21 @@ def convert_mp4_to_gif(mp4_path: str, gif_path: str, fps: int = 10) -> bool:
                 except Exception:
                     logging.exception("Failed to remove temporary ffmpeg palette file")
                     break
+
+    if ffmpeg_failed:
+        logging.warning("ffmpeg conversion failed; falling back to imageio")
+        # Remove any partially-created gif file so the imageio fallback
+        # can write a fresh output without colliding with remnants from
+        # the failed ffmpeg attempt.
+        try:
+            if os.path.exists(gif_path):
+                try:
+                    os.remove(gif_path)
+                except Exception:
+                    # Best-effort removal; if removal fails, continue to fallback
+                    logging.debug("Failed to remove partial gif before fallback")
+        except Exception:
+            logging.exception("Error while attempting to cleanup partial gif")
 
     # Fallback: use imageio to read video and write GIF
     reader = None

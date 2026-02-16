@@ -215,10 +215,20 @@ class ScreenRecorder:
         return True
 
     def stop(self, timeout: float = 5.0):
-        if not self._thread:
-            return self._out_path, True
+        # If not currently recording, return immediately without exposing
+        # any previously used output path (avoid returning stale paths).
+        if not self.is_recording():
+            return None, False
         self.request_stop()
         stopped_ok = self.wait_stopped(timeout=timeout)
         if not stopped_ok:
             logging.error("Recorder stop timed out; output may be incomplete")
-        return self._out_path, stopped_ok
+        out_path = self._out_path
+        if stopped_ok:
+            # Clear stored output path once the recorder stopped cleanly to
+            # avoid later accidental reuse.
+            self._out_path = None
+        else:
+            # On failure, don't leak the old path; return None when stop not ok.
+            out_path = None
+        return out_path, stopped_ok
